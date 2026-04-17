@@ -153,10 +153,26 @@ All messages include `protocol: "TETRA"` and a `type` field:
 
 | type | Key fields |
 |------|-----------|
-| `netinfo` | `mcc`, `mnc`, `dl_freq`, `ul_freq`, `color_code`, `encrypted` |
+| `netinfo` | `mcc`, `mnc`, `dl_freq`, `ul_freq`, `color_code`, `la`, `encrypted` |
+| `freqinfo` | `dl_freq`, `ul_freq` |
+| `encinfo` | `encrypted`, `enc_mode` (e.g. `"TEA2"`) |
 | `burst` | `slot` (0–3), `afc`, `burst_rate` |
-| `call_setup` | `issi`, `gssi`, `call_type`, `encrypted`, `slot` |
+| `call_setup` | `issi`, `gssi`, `call_id`, `call_type`, `encrypted`, `slot` |
 | `connect` | same as call_setup |
 | `tx_grant` | same as call_setup |
-| `call_release` | (no extra fields) |
+| `call_release` | `issi`, `call_id` |
+| `status` | `issi`, `to`, `status` |
 | `sds` | `from`, `to`, `text` |
+
+## Rate Limits (backend, per message category)
+
+| Category | Interval |
+|----------|---------|
+| `netinfo` | 5 s |
+| `freqinfo` | 10 s |
+| `encinfo` | 5 s |
+| `burst` | 0.25 s |
+| `call` (setup/connect/tx_grant) | 0.5 s |
+| `release` | 0.1 s |
+| `sds` | 1 s |
+| `status` | 1 s |

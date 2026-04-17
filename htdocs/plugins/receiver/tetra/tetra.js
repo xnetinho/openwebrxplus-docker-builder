@@ -1,17 +1,39 @@
 /*
  * tetra Receiver Plugin for OpenWebRX+
- * Displays TETRA signaling metadata in a panel styled like DMR.
+ *
+ * Displays TETRA (Terrestrial Trunked Radio) signaling metadata:
+ * network info, encryption mode, 4 TDMA timeslots, status and SDS messages.
+ *
+ * Requires the xnetinho/openwebrxplus-tetra Docker image (backend decoder).
  *
  * Load via init.js:
  *   await Plugins.load('https://xnetinho.github.io/openwebrxplus-docker-builder/plugins/receiver/tetra/tetra.js');
  *
  * License: MIT
- * Repository: https://github.com/xnetinho/openwebrxplus-docker-builder
+ * Copyright (c) 2026 xnetinho
+ *
+ * Changes:
+ * 1.1:
+ *  - robust TETMON parser: NETINFO1, FREQINFO1, ENCINFO1, DSETUPDEC,
+ *    DCONNECTDEC, DTXGRANTDEC, DRELEASEDEC, DSTATUSDEC, SDSDEC, BURST
+ *  - granular per-type rate limiting in backend
+ *  - two-stage codec (cdecoder | sdecoder) in backend
+ *  - GNURadio pi/4-DQPSK demodulation stage connected to tetra-rx
+ *  - new panel fields: Location Area (LA), encryption mode (TEA1/2/3),
+ *    network name map, status messages, SDS messages
+ *  - panel layout expanded proportionally to data; no overflow
+ * 1.0:
+ *  - initial release
  */
 
 Plugins.tetra = Plugins.tetra || {};
-Plugins.tetra._version = 1.0;
-Plugins.tetra.no_css = false;
+Plugins.tetra._version = 1.1;
+
+/*
+ * Optional network name map: add entries as 'MCC-MNC': 'Name'.
+ * Example: Plugins.tetra.networkNames['724-05'] = 'TIM Brasil';
+ */
+Plugins.tetra.networkNames = {};
 
 Plugins.tetra.init = function () {
 
@@ -20,7 +42,6 @@ Plugins.tetra.init = function () {
 		return false;
 	}
 
-	// Wait for OWRX to be fully initialised before touching the DOM
 	Plugins.utils.on_ready(function () {
 		Plugins.tetra._injectPanel();
 		Plugins.tetra._registerMetaPanel();
@@ -37,52 +58,88 @@ Plugins.tetra._injectPanel = function () {
 	var slots = '';
 	for (var i = 1; i <= 4; i++) {
 		slots +=
-			'<div class="openwebrx-meta-slot openwebrx-tetra-slot" id="tetra-slot-' + i + '">' +
-				'<div class="tetra-slot-number">Slot ' + i + '</div>' +
-				'<div class="openwebrx-meta-user-image">' +
-					'<img class="directcall" src="static/gfx/openwebrx-directcall.svg">' +
-					'<img class="groupcall"  src="static/gfx/openwebrx-groupcall.svg">' +
+			'<div class="openwebrx-tetra-slot" id="tetra-slot-' + i + '">' +
+				'<div class="tetra-slot-left">' +
+					'<span class="tetra-slot-number">TS ' + i + '</span>' +
+					'<div class="openwebrx-meta-user-image">' +
+						'<img class="directcall" src="static/gfx/openwebrx-directcall.svg">' +
+						'<img class="groupcall"  src="static/gfx/openwebrx-groupcall.svg">' +
+					'</div>' +
 				'</div>' +
-				'<div class="tetra-slot-info">' +
-					'<span class="tetra-issi" id="tetra-s' + i + '-issi">---</span>' +
-					'<span class="tetra-gssi" id="tetra-s' + i + '-gssi">---</span>' +
-					'<span class="tetra-calltype" id="tetra-s' + i + '-type"></span>' +
+				'<div class="tetra-slot-body">' +
+					'<div class="tetra-slot-row">' +
+						'<span class="tetra-slot-key">ISSI</span>' +
+						'<span class="tetra-slot-val tetra-issi" id="tetra-s' + i + '-issi">---</span>' +
+					'</div>' +
+					'<div class="tetra-slot-row">' +
+						'<span class="tetra-slot-key">GSSI</span>' +
+						'<span class="tetra-slot-val tetra-gssi" id="tetra-s' + i + '-gssi">---</span>' +
+					'</div>' +
+					'<div class="tetra-slot-row">' +
+						'<span class="tetra-slot-key">Type</span>' +
+						'<span class="tetra-slot-val tetra-calltype" id="tetra-s' + i + '-type">---</span>' +
+					'</div>' +
 				'</div>' +
 			'</div>';
 	}
 
 	var html =
-		'<div class="openwebrx-panel openwebrx-meta-panel" ' +
+		'<div class="openwebrx-panel openwebrx-meta-panel tetra-panel" ' +
 			'id="openwebrx-panel-metadata-tetra" ' +
 			'style="display:none" ' +
 			'data-panel-name="metadata-tetra">' +
-			'<div class="tetra-network">' +
-				'<span class="tetra-label">MCC/MNC</span>' +
-				'<span class="tetra-value" id="tetra-mcc-mnc">---</span>' +
-				'<span class="tetra-label">DL</span>' +
-				'<span class="tetra-value" id="tetra-dl">---</span>' +
-				'<span class="tetra-label">UL</span>' +
-				'<span class="tetra-value" id="tetra-ul">---</span>' +
-				'<span class="tetra-label">CC</span>' +
-				'<span class="tetra-value" id="tetra-cc">---</span>' +
-				'<span class="tetra-label">Enc</span>' +
-				'<span class="tetra-enc" id="tetra-enc">---</span>' +
+
+			'<div class="tetra-section">' +
+				'<div class="tetra-section-title">Network</div>' +
+				'<div class="tetra-grid">' +
+					'<span class="tetra-key">Name</span>' +
+					'<span class="tetra-val tetra-wide" id="tetra-netname">---</span>' +
+					'<span class="tetra-key">MCC / MNC</span>' +
+					'<span class="tetra-val" id="tetra-mcc-mnc">---</span>' +
+					'<span class="tetra-key">LA</span>' +
+					'<span class="tetra-val" id="tetra-la">---</span>' +
+					'<span class="tetra-key">DL Freq</span>' +
+					'<span class="tetra-val" id="tetra-dl">---</span>' +
+					'<span class="tetra-key">UL Freq</span>' +
+					'<span class="tetra-val" id="tetra-ul">---</span>' +
+					'<span class="tetra-key">Color Code</span>' +
+					'<span class="tetra-val" id="tetra-cc">---</span>' +
+					'<span class="tetra-key">Encryption</span>' +
+					'<span class="tetra-val tetra-enc" id="tetra-enc">---</span>' +
+				'</div>' +
 			'</div>' +
-			'<div class="tetra-signal">' +
-				'<span class="tetra-label">AFC</span>' +
-				'<span class="tetra-value" id="tetra-afc">---</span>' +
-				'<span class="tetra-label">Bursts/s</span>' +
-				'<span class="tetra-value" id="tetra-burst-rate">---</span>' +
+
+			'<div class="tetra-section">' +
+				'<div class="tetra-section-title">Signal</div>' +
+				'<div class="tetra-grid">' +
+					'<span class="tetra-key">AFC</span>' +
+					'<span class="tetra-val" id="tetra-afc">---</span>' +
+					'<span class="tetra-key">Bursts/s</span>' +
+					'<span class="tetra-val" id="tetra-burst-rate">---</span>' +
+				'</div>' +
 			'</div>' +
-			slots +
+
+			'<div class="tetra-section">' +
+				'<div class="tetra-section-title">Timeslots</div>' +
+				slots +
+			'</div>' +
+
+			'<div class="tetra-section tetra-messages" id="tetra-status-section" style="display:none">' +
+				'<div class="tetra-section-title">Status</div>' +
+				'<div class="tetra-message-row" id="tetra-last-status">---</div>' +
+			'</div>' +
+
+			'<div class="tetra-section tetra-messages" id="tetra-sds-section" style="display:none">' +
+				'<div class="tetra-section-title">SDS</div>' +
+				'<div class="tetra-message-row" id="tetra-last-sds">---</div>' +
+			'</div>' +
+
 		'</div>';
 
-	// Insert after DMR panel to keep meta panels grouped together
 	var dmr = document.getElementById('openwebrx-panel-metadata-dmr');
 	if (dmr && dmr.parentNode) {
 		dmr.insertAdjacentHTML('afterend', html);
 	} else {
-		// Fallback: append alongside the first existing meta panel
 		var existing = document.querySelector('.openwebrx-meta-panel');
 		if (existing && existing.parentNode) {
 			existing.parentNode.insertAdjacentHTML('beforeend', html);
@@ -100,14 +157,13 @@ Plugins.tetra._registerMetaPanel = function () {
 
 	function TetraMetaSlot(el) {
 		this.el = $(el);
-		this._data = null;
+		this.idx = parseInt(this.el.attr('id').replace('tetra-slot-', ''), 10);
 	}
 
 	TetraMetaSlot.prototype.update = function (data) {
 		var callType = (data.call_type || 'group').toLowerCase();
 
-		this.el.addClass('active');
-		this.el.removeClass('groupcall directcall emergency');
+		this.el.addClass('active').removeClass('groupcall directcall emergency');
 		if (callType.indexOf('individual') >= 0 || callType.indexOf('direct') >= 0) {
 			this.el.addClass('directcall');
 		} else if (callType.indexOf('emergency') >= 0) {
@@ -122,24 +178,20 @@ Plugins.tetra._registerMetaPanel = function () {
 			this.el.removeClass('encrypted');
 		}
 
-		this._setText('issi', data.issi || '---');
-		this._setText('gssi', data.gssi ? '\u2192 ' + data.gssi : '---');
-		this._setText('type', callType);
-		this._data = data;
+		this._set('issi', data.issi || '---');
+		this._set('gssi', data.gssi || '---');
+		this._set('type', callType || '---');
 	};
 
 	TetraMetaSlot.prototype.clear = function () {
 		this.el.removeClass('active groupcall directcall emergency encrypted');
-		var slotNum = this.el.attr('id').replace('tetra-slot-', '');
-		$('#tetra-s' + slotNum + '-issi').text('---');
-		$('#tetra-s' + slotNum + '-gssi').text('---');
-		$('#tetra-s' + slotNum + '-type').text('');
-		this._data = null;
+		this._set('issi', '---');
+		this._set('gssi', '---');
+		this._set('type', '---');
 	};
 
-	TetraMetaSlot.prototype._setText = function (field, value) {
-		var slotNum = this.el.attr('id').replace('tetra-slot-', '');
-		$('#tetra-s' + slotNum + '-' + field).text(value || '---');
+	TetraMetaSlot.prototype._set = function (field, value) {
+		$('#tetra-s' + this.idx + '-' + field).text(value);
 	};
 
 	// ── TetraMetaPanel ─────────────────────────────────────────────────────────
@@ -157,52 +209,78 @@ Plugins.tetra._registerMetaPanel = function () {
 
 	TetraMetaPanel.prototype.update = function (data) {
 		if (!this.isSupported(data)) return;
-
 		var type = data.type;
 
 		if (type === 'netinfo') {
-			$('#tetra-mcc-mnc').text((data.mcc || '?') + '/' + (data.mnc || '?'));
+			var mcc = data.mcc || '?';
+			var mnc = data.mnc || '?';
+			var netKey = mcc + '-' + mnc;
+			var netName = Plugins.tetra.networkNames[netKey] || '---';
+			$('#tetra-netname').text(netName);
+			$('#tetra-mcc-mnc').text(mcc + ' / ' + mnc);
+			$('#tetra-la').text(data.la || '---');
 			$('#tetra-dl').text(Plugins.tetra._formatFreq(data.dl_freq));
 			$('#tetra-ul').text(Plugins.tetra._formatFreq(data.ul_freq));
-			$('#tetra-cc').text(data.color_code || '---');
-			Plugins.tetra._setEnc(data.encrypted);
+			$('#tetra-cc').text(data.color_code !== undefined && data.color_code !== '' ? data.color_code : '---');
+			Plugins.tetra._setEnc(data.encrypted, null);
+
+		} else if (type === 'freqinfo') {
+			$('#tetra-dl').text(Plugins.tetra._formatFreq(data.dl_freq));
+			$('#tetra-ul').text(Plugins.tetra._formatFreq(data.ul_freq));
+
+		} else if (type === 'encinfo') {
+			Plugins.tetra._setEnc(data.encrypted, data.enc_mode);
 
 		} else if (type === 'burst') {
-			$('#tetra-afc').text(data.afc || '---');
+			$('#tetra-afc').text(data.afc !== undefined ? data.afc : '---');
 			$('#tetra-burst-rate').text(data.burst_rate || '---');
-			var slotNum = (data.slot || 0);
-			if (slotNum >= 0 && slotNum < this.slots.length) {
-				$('#tetra-slot-' + (slotNum + 1)).addClass('active');
+			var si = (data.slot || 0);
+			if (si >= 0 && si < this.slots.length) {
+				this.slots[si].el.addClass('active');
 			}
 
 		} else if (type === 'call_setup' || type === 'connect' || type === 'tx_grant') {
-			var slotIdx = (data.slot || 0);
-			if (slotIdx >= 0 && slotIdx < this.slots.length) {
-				this.slots[slotIdx].update(data);
+			var si2 = (data.slot || 0);
+			if (si2 >= 0 && si2 < this.slots.length) {
+				this.slots[si2].update(data);
 			}
 
 		} else if (type === 'call_release') {
 			for (var i = 0; i < this.slots.length; i++) {
 				this.slots[i].clear();
 			}
+
+		} else if (type === 'status') {
+			var stxt = (data.issi || '?') + ' \u2192 ' + (data.to || '?') + ': Status ' + (data.status || '?');
+			$('#tetra-last-status').text(stxt);
+			$('#tetra-status-section').show();
+
+		} else if (type === 'sds') {
+			var sdstxt = (data.from || '?') + ' \u2192 ' + (data.to || '?') + ': ' + (data.text || '');
+			$('#tetra-last-sds').text(sdstxt);
+			$('#tetra-sds-section').show();
 		}
 	};
 
 	TetraMetaPanel.prototype.clear = function () {
 		MetaPanel.prototype.clear.call(this);
+		$('#tetra-netname').text('---');
 		$('#tetra-mcc-mnc').text('---');
+		$('#tetra-la').text('---');
 		$('#tetra-dl').text('---');
 		$('#tetra-ul').text('---');
 		$('#tetra-cc').text('---');
-		$('#tetra-enc').text('---').removeClass('enc-yes enc-no');
+		$('#tetra-enc').text('---').removeClass('enc-yes enc-no enc-tea');
 		$('#tetra-afc').text('---');
 		$('#tetra-burst-rate').text('---');
+		$('#tetra-status-section').hide();
+		$('#tetra-sds-section').hide();
 		for (var i = 0; i < this.slots.length; i++) {
 			this.slots[i].clear();
 		}
 	};
 
-	// ── Register and initialise ────────────────────────────────────────────────
+	// ── Register ───────────────────────────────────────────────────────────────
 
 	MetaPanel.types['tetra'] = TetraMetaPanel;
 
@@ -216,14 +294,18 @@ Plugins.tetra._registerMetaPanel = function () {
 
 Plugins.tetra._formatFreq = function (hz) {
 	if (!hz) return '---';
-	return (parseFloat(hz) / 1e6).toFixed(4) + ' MHz';
+	var n = parseFloat(hz);
+	if (isNaN(n) || n === 0) return '---';
+	return (n / 1e6).toFixed(4) + ' MHz';
 };
 
-Plugins.tetra._setEnc = function (encrypted) {
+Plugins.tetra._setEnc = function (encrypted, encMode) {
 	var $el = $('#tetra-enc');
+	$el.removeClass('enc-yes enc-no enc-tea');
 	if (encrypted) {
-		$el.text('YES').removeClass('enc-no').addClass('enc-yes');
+		var label = (encMode && encMode !== 'None') ? encMode : 'YES';
+		$el.text(label).addClass(encMode && encMode !== 'None' ? 'enc-tea' : 'enc-yes');
 	} else {
-		$el.text('NO').removeClass('enc-yes').addClass('enc-no');
+		$el.text('No').addClass('enc-no');
 	}
 };
