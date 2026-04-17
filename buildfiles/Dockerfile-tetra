@@ -1,0 +1,35 @@
+# Stage 1: compile tetra-rx and ETSI ACELP codec
+FROM debian:bookworm-slim AS tetra-builder
+ARG MAKEFLAGS=-j4
+ARG APT_PROXY
+
+COPY common.sh /
+COPY build-tetra-packages.sh /
+
+RUN --mount=type=cache,id=owrxp-tetra-buildcache,target=/build_cache \
+    bash /build-tetra-packages.sh
+
+# Stage 2: runtime — extends the softmbe image already on Docker Hub
+FROM slechev/openwebrxplus-softmbe:latest
+
+# Compiled binaries from stage 1
+COPY --from=tetra-builder /build_artifacts/tetra/ /tmp/tetra_files/
+
+# Python modules and patch script
+COPY files/patch_tetra.py       /tmp/tetra_files/patch_tetra.py
+COPY files/csdr_chain_tetra.py  /tmp/tetra_files/csdr_chain_tetra.py
+COPY files/csdr_module_tetra.py /tmp/tetra_files/csdr_module_tetra.py
+COPY files/tetra_decoder.py     /tmp/tetra_files/tetra_decoder.py
+
+COPY common.sh /
+COPY install-tetra-packages.sh /
+
+RUN bash /install-tetra-packages.sh
+
+HEALTHCHECK CMD /healthcheck.sh || exit 1
+
+WORKDIR /
+ENTRYPOINT ["/init"]
+VOLUME /etc/openwebrx
+VOLUME /var/lib/openwebrx
+EXPOSE 8073

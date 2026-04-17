@@ -1,0 +1,133 @@
+/* TETRA plugin — visual style mirrors the DMR meta panel */
+
+#openwebrx-panel-metadata-tetra {
+	min-width: 220px;
+	max-width: 280px;
+	font-size: 0.85em;
+	padding: 6px 0;
+}
+
+/* ── Network / signal info rows ──────────────────────────────────────────── */
+
+.tetra-network,
+.tetra-signal {
+	display: grid;
+	grid-template-columns: auto 1fr;
+	gap: 2px 8px;
+	padding: 4px 10px;
+	border-bottom: 1px solid rgba(255,255,255,0.08);
+}
+
+.tetra-label {
+	color: rgba(255,255,255,0.45);
+	white-space: nowrap;
+	font-size: 0.8em;
+	align-self: center;
+}
+
+.tetra-value {
+	color: #ddd;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	align-self: center;
+}
+
+.tetra-enc {
+	align-self: center;
+	font-weight: bold;
+}
+
+.tetra-enc.enc-yes { color: #e55; }
+.tetra-enc.enc-no  { color: #5c5; }
+
+/* ── Timeslots (mirrors .openwebrx-dmr-timeslot-panel style) ─────────────── */
+
+.openwebrx-tetra-slot {
+	display: flex;
+	align-items: center;
+	padding: 4px 10px;
+	gap: 8px;
+	opacity: 0.4;
+	transition: opacity 0.2s, background-color 0.2s;
+	border-left: 3px solid transparent;
+	cursor: default;
+}
+
+.openwebrx-tetra-slot.active {
+	opacity: 1;
+	background-color: rgba(255,255,255,0.05);
+}
+
+.openwebrx-tetra-slot.groupcall  { border-left-color: #4a9eff; }
+.openwebrx-tetra-slot.directcall { border-left-color: #f0a030; }
+.openwebrx-tetra-slot.emergency  { border-left-color: #e55; }
+
+.openwebrx-tetra-slot.encrypted .tetra-slot-number::after {
+	content: ' \1F512'; /* lock emoji */
+	font-size: 0.75em;
+}
+
+.tetra-slot-number {
+	color: rgba(255,255,255,0.45);
+	font-size: 0.78em;
+	min-width: 38px;
+	flex-shrink: 0;
+}
+
+/* ── User image — same technique as DMR ──────────────────────────────────── */
+
+.openwebrx-tetra-slot .openwebrx-meta-user-image {
+	width: 24px;
+	height: 24px;
+	flex-shrink: 0;
+	position: relative;
+}
+
+.openwebrx-tetra-slot .openwebrx-meta-user-image img {
+	position: absolute;
+	inset: 0;
+	width: 100%;
+	height: 100%;
+	object-fit: contain;
+	opacity: 0;
+	transition: opacity 0.15s;
+}
+
+.openwebrx-tetra-slot.groupcall  .openwebrx-meta-user-image img.groupcall  { opacity: 1; }
+.openwebrx-tetra-slot.directcall .openwebrx-meta-user-image img.directcall { opacity: 1; }
+.openwebrx-tetra-slot.emergency  .openwebrx-meta-user-image img.directcall { opacity: 1; }
+
+/* ── Slot text fields ─────────────────────────────────────────────────────── */
+
+.tetra-slot-info {
+	display: flex;
+	flex-direction: column;
+	flex: 1;
+	overflow: hidden;
+	gap: 1px;
+}
+
+.tetra-issi {
+	font-weight: bold;
+	color: #eee;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.tetra-gssi {
+	font-size: 0.82em;
+	color: rgba(255,255,255,0.55);
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.tetra-calltype {
+	font-size: 0.75em;
+	color: rgba(255,255,255,0.4);
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+	white-space: nowrap;
+}

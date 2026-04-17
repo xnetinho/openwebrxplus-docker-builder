@@ -6,6 +6,7 @@ cd "${CWD}" || exit 1
 source "${CWD}"/lib/log.sh
 
 DOCKER_HUB_USER=slechev
+TETRA_DOCKER_HUB_USER=xnetinho
 PRODUCT=openwebrxplus
 DATE=$(date +%F)
 SOURCES_SCRIPTS_FINGERPRINT=$(find "${CWD}/buildfiles/scripts/sources" -maxdepth 1 -type f -name '*.sh' -print0 | sort -z | xargs -0 sha256sum 2>/dev/null | sha256sum | awk '{print $1}')
@@ -113,6 +114,81 @@ get_owrxp_commit() {
   git ls-remote https://github.com/luarvique/openwebrx.git refs/heads/master 2>/dev/null | awk 'NR==1 {print $1}'
 }
 
+# ── Lightweight build (softmbe / tetra) ──────────────────────────────────────
+# Builds images that extend a pre-existing Docker Hub base without the heavy
+# multi-stage compilation pipeline. No APT cache server required.
+
+build-light() {
+  local DOCKERFILE="${1}"
+  local PROD_NAME="${2}"
+  local HUB_USER="${3:-${DOCKER_HUB_USER}}"
+
+  if [ ! -f "${DOCKERFILE}" ]; then
+    log err "Cannot find Dockerfile '${DOCKERFILE}'"
+    exit 1
+  fi
+
+  local CACHE_DIR
+  CACHE_DIR="$(pwd)/cache/${PROD_NAME//[^a-zA-Z0-9._-]/_}"
+  mkdir -p "${CACHE_DIR}"
+
+  local VER
+  VER=$(get_owrxp_version)
+  log inf "Building '${HUB_USER}/${PROD_NAME}:${VER}' from ${DOCKERFILE}"
+  log inf "Using cache dir: ${CACHE_DIR}"
+  echo
+
+  docker buildx create \
+    --name owrxp-builder \
+    --driver docker-container \
+    --bootstrap \
+    --use \
+    --driver-opt network=host \
+    2>/dev/null || true
+
+  time docker buildx build -f "${DOCKERFILE}" \
+    --platform linux/amd64,linux/arm64,linux/arm/v7 \
+    --cache-from type=local,src="${CACHE_DIR}" \
+    --cache-to   type=local,dest="${CACHE_DIR}" \
+    --build-arg MAKEFLAGS="${MAKEFLAGS}" \
+    --build-arg APT_PROXY="${APT_PROXY}" \
+    -t "${HUB_USER}/${PROD_NAME}:${VER}" \
+    -t "${HUB_USER}/${PROD_NAME}:latest" \
+    --pull \
+    --push \
+    ./buildfiles || exit 1
+}
+
+# ── build-softmbe ─────────────────────────────────────────────────────────────
+# Builds the softmbe image directly from slechev/openwebrxplus on Docker Hub.
+# Does NOT require the heavy main-image compilation.
+# Chains into build-tetra automatically when done.
+
+build-softmbe() {
+  log inf "Building SoftMBE image directly from Docker Hub base..."
+  build-light "buildfiles/Dockerfile-softmbe" "${PRODUCT}-softmbe"
+
+  log inf "SoftMBE build complete. Starting TETRA build..."
+  build-tetra
+}
+
+# ── build-tetra ───────────────────────────────────────────────────────────────
+# Builds the tetra image (xnetinho/openwebrxplus-tetra) from the softmbe base.
+# Does NOT require the heavy main-image compilation.
+# This is always the last step in the build chain — cleans up the builder.
+
+build-tetra() {
+  log inf "Building TETRA image directly from SoftMBE base..."
+  build-light "buildfiles/Dockerfile-tetra" "${PRODUCT}-tetra" "${TETRA_DOCKER_HUB_USER}"
+
+  log inf "Removing docker builder (keeping state/caches for next use)..."
+  docker buildx rm --keep-state owrxp-builder 2>/dev/null || true
+
+  log suc "Full build chain complete: ${DOCKER_HUB_USER}/${PRODUCT} → ${DOCKER_HUB_USER}/${PRODUCT}-softmbe → ${TETRA_DOCKER_HUB_USER}/${PRODUCT}-tetra"
+}
+
+# ── build (main — heavy) ─────────────────────────────────────────────────────
+
 build() {
   check-apt || start-apt-cache
 
@@ -157,7 +233,7 @@ build() {
 
   local CACHE_DIR
   CACHE_DIR="${PROD}${PRODUCT_EXTRA}"
-  CACHE_DIR=${CACHE_DIR//[^a-zA-Z0-9._-]/_} # sanitize
+  CACHE_DIR=${CACHE_DIR//[^a-zA-Z0-9._-]/_}
 
   CACHE_DIR="$(pwd)/cache/${CACHE_DIR}"
   log inf "Using cache dir: ${CACHE_DIR}"
@@ -181,8 +257,6 @@ build() {
   echo
 
   mkdir -p "${CACHE_DIR}"
-  # create docker builder https://docs.docker.com/build/building/multi-platform/
-  # we enable networking so the builder container has access to the host network (needed for registry)
   log inf "Creating docker builder for multiarch..."
   docker buildx create \
     --name owrxp-builder \
@@ -190,7 +264,7 @@ build() {
     --bootstrap \
     --use \
     --driver-opt network=host \
-    2>/dev/null || true # ignore errors if already created
+    2>/dev/null || true
 
   log inf "Building $PROD$PRODUCT_EXTRA from $DOCKERFILE for AMD64, ARM64 and ARM32v7."
   log inf "Sources fingerprint: ${SOURCES_SCRIPTS_FINGERPRINT}"
@@ -213,35 +287,14 @@ build() {
     --push \
     ./buildfiles || exit 1
 
-  #--progress=plain \
-  #--load \
-  #--platform linux/amd64,linux/arm64,linux/arm/v7 \
-  #--platform linux/amd64 \
-  #--cache-from=type=local,src=`pwd`/cache
-  #--cache-to=type=local,dest=`pwd`/cache
-
-  if [[ "${PRODUCT_EXTRA}" != *softmbe* ]]; then
-    log inf "Building SoftMBE image $PROD$PRODUCT_EXTRA for AMD64, ARM64 and ARM32v7."
-    if [ "$force_final" -eq 1 ]; then
-      build --force-final "buildfiles/Dockerfile-softmbe" "${PROD}${PRODUCT_EXTRA}"
-    else
-      build "buildfiles/Dockerfile-softmbe" "${PROD}${PRODUCT_EXTRA}"
-    fi
-  fi
-  # time docker buildx build \
-  #   --platform linux/amd64,linux/arm64,linux/arm/v7 \
-  #   --build-arg MAKEFLAGS="${MAKEFLAGS}" \
-  #   -t "${DOCKER_HUB_USER}"/"${PRODUCT}-softmbe${PRODUCT_EXTRA}":"${VER}" \
-  #   -t "${DOCKER_HUB_USER}"/"${PRODUCT}-softmbe${PRODUCT_EXTRA}" \
-  #   --pull \
-  #   --push \
-  #   ./buildfiles-softmbe || exit 1
-
-  if [[ "${PRODUCT_EXTRA}" != *softmbe* ]]; then
-    log inf "Removing docker builder (keeping state/caches for next use)..."
-    docker buildx rm --keep-state owrxp-builder # keep state is needed to keep the caches for the next build
+  # Chain into lightweight softmbe → tetra builds
+  if [[ "${PRODUCT_EXTRA}" != *softmbe* ]] && [[ "${PRODUCT_EXTRA}" != *tetra* ]]; then
+    log inf "Main build complete. Starting SoftMBE + TETRA builds..."
+    build-softmbe
   fi
 }
+
+# ── Container run helpers ─────────────────────────────────────────────────────
 
 run_internal() {
   mkdir -p work/owrx/var work/owrx/etc
@@ -262,6 +315,18 @@ run() {
   IMAGE=${1:-"${DOCKER_HUB_USER}/${PRODUCT}"}
   docker pull ${IMAGE} || true
   run_internal ${IMAGE}
+}
+
+run-softmbe() {
+  local IMAGE="${DOCKER_HUB_USER}/${PRODUCT}-softmbe"
+  docker pull "${IMAGE}" || true
+  run_internal "${IMAGE}"
+}
+
+run-tetra() {
+  local IMAGE="${TETRA_DOCKER_HUB_USER}/${PRODUCT}-tetra"
+  docker pull "${IMAGE}" || true
+  run_internal "${IMAGE}"
 }
 
 dev_internal() {
@@ -293,6 +358,12 @@ dev() {
   dev_internal ${IMAGE}
 }
 
+dev-tetra() {
+  local IMAGE="${TETRA_DOCKER_HUB_USER}/${PRODUCT}-tetra"
+  docker pull "${IMAGE}" || true
+  dev_internal "${IMAGE}"
+}
+
 ## MAIN
 log "Builder for OpenWebRX+ Docker Image"
 check-docker
@@ -300,11 +371,19 @@ check-docker
 usage() {
   log war "Usage: $0 [command]"
   log war ". commands:"
-  log war "... build [--force-final] [Dockerfile] - build and push; force final stage rebuild when requested"
-  log war "... run [${DOCKER_HUB_USER}/${PRODUCT}] - run container from latest image"
-  log war "... dev [${DOCKER_HUB_USER}/${PRODUCT}] - start container with bash shell"
-  log war "... add-admin - to add 'admin' user to the running docker container"
-  log war "... clean [--yes] - remove builders, caches, apt-cache stack, and local work/cache folders"
+  log war "... build [--force-final] [Dockerfile]  - full build (heavy); chains softmbe→tetra automatically"
+  log war "... build-softmbe                        - build softmbe image from Docker Hub base; chains tetra"
+  log war "... build-tetra                          - build tetra image (${TETRA_DOCKER_HUB_USER}/${PRODUCT}-tetra) from softmbe base"
+  log war "... run [image]                          - run container from latest image"
+  log war "... run-softmbe                          - run softmbe container"
+  log war "... run-tetra                            - run tetra container"
+  log war "... dev [image]                          - start container with bash shell"
+  log war "... dev-tetra                            - start tetra container with bash shell"
+  log war "... add-admin                            - add 'admin' user to the running container"
+  log war "... clean [--yes]                        - remove builders, caches, apt-cache stack, and local work/cache"
+  echo
+  log war "Build chain: build → build-softmbe → build-tetra"
+  log war "You can start at any point in the chain."
   echo
   log war "You can specify MAKEFLAGS for docker builds:"
   log war "[6[MAKEFLAGS=\"-j4\" $0]]"
