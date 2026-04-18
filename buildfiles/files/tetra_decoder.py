@@ -31,10 +31,9 @@ import time
 logging.basicConfig(level=logging.WARNING, format="%(name)s: %(message)s")
 logger = logging.getLogger("tetra_decoder")
 
-TETRA_RX  = "/opt/openwebrx-tetra/tetra-rx"
-CDECODER  = "/opt/openwebrx-tetra/cdecoder"
-SDECODER  = "/opt/openwebrx-tetra/sdecoder"
-TETRA_DEC = "/opt/openwebrx-tetra/tetra-dec"
+TETRA_RX = "/opt/openwebrx-tetra/tetra-rx"
+CDECODER = "/opt/openwebrx-tetra/cdecoder"
+SDECODER = "/opt/openwebrx-tetra/sdecoder"
 
 INPUT_RATE  = 36000
 OUTPUT_RATE = 8000
@@ -318,93 +317,67 @@ def _tetmon_listener(
 
 class _AudioPipeline:
     """
-    Two-stage ACELP codec: cdecoder stdout → pipe → sdecoder stdin.
-    Falls back to a single cdecoder (or tetra-dec) if sdecoder is absent.
+    TETMON audio path: TRA: frames (already channel-decoded by tetra-rx) go
+    directly to sdecoder.  cdecoder is the channel decoder and is NOT needed.
+
+    sdecoder/cdecoder require filename args — use /dev/stdin /dev/stdout so
+    they read/write through the pipes we hand them as fd 0/1.
     """
 
     def __init__(self):
-        self._cdecoder = None
-        self._sdecoder = None
-        self._two_stage = False
+        self._decoder = None
         self._lock = threading.Lock()
 
     def start(self) -> None:
-        if os.path.isfile(CDECODER) and os.path.isfile(SDECODER):
-            try:
-                r_fd, w_fd = os.pipe()
-                self._cdecoder = subprocess.Popen(
-                    [CDECODER],
-                    stdin=subprocess.PIPE,
-                    stdout=w_fd,
-                    stderr=subprocess.DEVNULL,
-                )
-                os.close(w_fd)
-                self._sdecoder = subprocess.Popen(
-                    [SDECODER],
-                    stdin=r_fd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                )
-                os.close(r_fd)
-                self._two_stage = True
-                logger.debug("Audio: cdecoder | sdecoder (two-stage)")
-                return
-            except Exception as e:
-                logger.warning("Two-stage codec failed (%s), falling back", e)
-                self._teardown()
-
-        dec = CDECODER if os.path.isfile(CDECODER) else TETRA_DEC
-        self._cdecoder = subprocess.Popen(
-            [dec],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
-        self._two_stage = False
-        logger.debug("Audio: single-stage %s", dec)
-
-    def _pcm_src(self):
-        return self._sdecoder if self._two_stage else self._cdecoder
+        dec = SDECODER if os.path.isfile(SDECODER) else CDECODER
+        if not os.path.isfile(dec):
+            logger.warning("No ACELP decoder found (%s / %s)", SDECODER, CDECODER)
+            return
+        try:
+            self._decoder = subprocess.Popen(
+                [dec, "/dev/stdin", "/dev/stdout"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            logger.debug("Audio: %s /dev/stdin /dev/stdout", dec)
+        except Exception as e:
+            logger.warning("Decoder start failed: %s", e)
 
     def feed(self, frame: bytes) -> bytes:
         with self._lock:
+            if not self._decoder or self._decoder.poll() is not None:
+                return SILENCE
             try:
-                if not self._cdecoder or self._cdecoder.poll() is not None:
-                    return SILENCE
-                self._cdecoder.stdin.write(frame)
-                self._cdecoder.stdin.flush()
-                out = self._pcm_src()
-                if not out or out.poll() is not None:
-                    return SILENCE
+                self._decoder.stdin.write(frame)
+                self._decoder.stdin.flush()
                 pcm = b""
-                deadline = time.monotonic() + 0.1
-                while len(pcm) < PCM_BYTES and time.monotonic() < deadline:
-                    chunk = out.stdout.read(PCM_BYTES - len(pcm))
+                deadline = time.monotonic() + 0.15
+                while time.monotonic() < deadline:
+                    ready, _, _ = select.select([self._decoder.stdout], [], [], 0.05)
+                    if not ready:
+                        break
+                    chunk = os.read(self._decoder.stdout.fileno(), 4096)
                     if not chunk:
                         break
                     pcm += chunk
-                return pcm if len(pcm) == PCM_BYTES else SILENCE
+                return pcm if pcm else SILENCE
             except Exception:
                 return SILENCE
 
-    def _teardown(self) -> None:
-        for p in (self._sdecoder, self._cdecoder):
-            if p:
-                try:
-                    p.stdin.close()
-                except Exception:
-                    pass
-                try:
-                    p.terminate()
-                    p.wait(timeout=2)
-                except Exception:
-                    pass
-        self._cdecoder = None
-        self._sdecoder = None
-
     def stop(self) -> None:
         with self._lock:
-            self._teardown()
+            if self._decoder:
+                try:
+                    self._decoder.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    self._decoder.terminate()
+                    self._decoder.wait(timeout=2)
+                except Exception:
+                    pass
+                self._decoder = None
 
 
 # ── Pi/4-DQPSK demodulator ────────────────────────────────────────────────────
