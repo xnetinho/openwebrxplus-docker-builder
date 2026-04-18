@@ -60,6 +60,10 @@ class Tetra(_BaseDemodulatorChain):
     def getOutputSampleRate(self):
         return 8000
 
+    def setMetaWriter(self, writer):
+        """Forward the DspManager's meta writer down to the decoder module."""
+        self._decoder.setMetaWriter(writer)
+
     def stop(self):
         if hasattr(self, "_decoder") and self._decoder is not None:
             self._decoder.stop()
