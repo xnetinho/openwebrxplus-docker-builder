@@ -1,8 +1,46 @@
-from csdr.chain import BaseDemodulatorChain
-from csdr.modules.tetra import TetraDecoderModule
+# Locate the correct base chain class across OpenWebRX+ versions.
+# Known locations:
+#   csdr.chain               (older builds)
+#   csdr.chain.demodulator   (newer builds)
+_BaseDemodulatorChain = None
+for _mod_path, _cls_name in [
+    ("csdr.chain",            "BaseDemodulatorChain"),
+    ("csdr.chain.demodulator","BaseDemodulatorChain"),
+    ("csdr.chain",            "Chain"),
+    ("csdr.chain.analog",     "AnalogDemodulator"),
+]:
+    try:
+        import importlib as _il
+        _m = _il.import_module(_mod_path)
+        _BaseDemodulatorChain = getattr(_m, _cls_name, None)
+        if _BaseDemodulatorChain is not None:
+            break
+    except ImportError:
+        continue
+
+if _BaseDemodulatorChain is None:
+    raise ImportError(
+        "Cannot find a suitable base chain class in csdr.chain — "
+        "check the csdr Python package version."
+    )
+
+# Locate TetraDecoderModule (csdr.module vs csdr.modules across versions)
+_TetraDecoderModule = None
+for _mod_path in ("csdr.modules.tetra", "csdr.module.tetra"):
+    try:
+        import importlib as _il
+        _m = _il.import_module(_mod_path)
+        _TetraDecoderModule = getattr(_m, "TetraDecoderModule", None)
+        if _TetraDecoderModule is not None:
+            break
+    except ImportError:
+        continue
+
+if _TetraDecoderModule is None:
+    raise ImportError("Cannot import TetraDecoderModule from csdr.modules.tetra or csdr.module.tetra")
 
 
-class Tetra(BaseDemodulatorChain):
+class Tetra(_BaseDemodulatorChain):
     """
     TETRA demodulator chain.
     Input:  complex float IQ at 36000 S/s (pi/4-DQPSK, 25 kHz channel)
@@ -10,7 +48,7 @@ class Tetra(BaseDemodulatorChain):
     """
 
     def __init__(self):
-        self._decoder = TetraDecoderModule()
+        self._decoder = _TetraDecoderModule()
         super().__init__([self._decoder])
 
     def supportsSquelch(self):
