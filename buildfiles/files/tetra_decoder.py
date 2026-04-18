@@ -559,12 +559,15 @@ def main() -> None:
     tetra_env["TETRA_HACK_PORT"] = str(TETMON_PORT)
     tetra_env["TETRA_HACK_IP"]   = "127.0.0.1"
 
+    # tetra-rx reads from a file argument, not stdin.
+    # Pass the pipe read-end via /proc/self/fd/N and keep it open in the child.
     tetra_rx = subprocess.Popen(
-        [TETRA_RX],
-        stdin=gn_r,
+        [TETRA_RX, f"/proc/self/fd/{gn_r}"],
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=tetra_env,
+        pass_fds=(gn_r,),
     )
     os.close(gn_r)
 
