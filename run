@@ -146,10 +146,13 @@ build-light() {
     --driver-opt network=host \
     2>/dev/null || true
 
+  local cache_from_arg=()
+  [ -f "${CACHE_DIR}/index.json" ] && cache_from_arg=(--cache-from "type=local,src=${CACHE_DIR}")
+
   time docker buildx build -f "${DOCKERFILE}" \
     --platform linux/amd64,linux/arm64,linux/arm/v7 \
-    --cache-from type=local,src="${CACHE_DIR}" \
-    --cache-to   type=local,dest="${CACHE_DIR}" \
+    "${cache_from_arg[@]}" \
+    --cache-to type=local,dest="${CACHE_DIR}" \
     --build-arg MAKEFLAGS="${MAKEFLAGS}" \
     --build-arg APT_PROXY="${APT_PROXY}" \
     -t "${HUB_USER}/${PROD_NAME}:${VER}" \
