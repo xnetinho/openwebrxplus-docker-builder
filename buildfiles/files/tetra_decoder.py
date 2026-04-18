@@ -423,8 +423,9 @@ def _run_gnuradio(src_fd: int, sink_fd: int, stop_event: threading.Event) -> Non
         tb.stop()
         tb.wait()
 
-    except ImportError:
-        logger.warning("GNURadio not available — passing raw IQ to tetra-rx (may not decode)")
+    except Exception as _gr_err:
+        logger.warning("GNURadio unavailable (%s: %s) — passing raw IQ to tetra-rx (will not decode properly)",
+                       type(_gr_err).__name__, _gr_err)
         try:
             while not stop_event.is_set():
                 try:
