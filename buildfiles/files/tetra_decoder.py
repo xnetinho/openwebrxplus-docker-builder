@@ -6,15 +6,16 @@ stdout: 16-bit signed LE PCM at 8 kHz mono
 stderr: JSON metadata lines (one object per line)
 
 Pipeline:
-  stdin IQ → GNURadio pi/4-DQPSK demod → tetra-rx → cdecoder | sdecoder → stdout PCM
-                                               |
-                                         TETMON UDP:7379 → JSON → stderr
+  stdin IQ → pi/4-DQPSK demod → tetra-rx → cdecoder | sdecoder → stdout PCM
+                                     |
+                               TETMON UDP:7379 → JSON → stderr
 
 Author: adapted from mbbrzoza/OpenWebRX-Tetra-Plugin and trollminer/OpenWebRX-Tetra-Plugin
 """
 
 import json
 import logging
+import math
 import os
 import re
 import select
@@ -25,8 +26,6 @@ import subprocess
 import sys
 import threading
 import time
-
-import numpy as np
 
 logging.basicConfig(level=logging.WARNING, format="%(name)s: %(message)s")
 logger = logging.getLogger("tetra_decoder")
@@ -392,95 +391,32 @@ class _AudioPipeline:
             self._teardown()
 
 
-# ── Pi/4-DQPSK demodulator (numpy) ───────────────────────────────────────────
+# ── Pi/4-DQPSK demodulator (pure Python stdlib) ───────────────────────────────
 #
-# TETRA: pi/4-DQPSK, 18 kBaud, 2 samples/symbol at 36 kS/s, alpha=0.35 RRC.
+# TETRA: pi/4-DQPSK, 18 kBaud, 2 samples/symbol at 36 kS/s.
+# No external dependencies — only struct and math.
 # Output: one bit per byte (value 0 or 1) → tetra-rx stdin.
+#
+# ETSI EN 300 392-2 Table 8.2 Gray mapping:
+#   Δφ = +π/4  → 00   (region  0 .. π/2)
+#   Δφ = +3π/4 → 01   (region  π/2 .. π)
+#   Δφ = -3π/4 → 11   (region -π .. -π/2)
+#   Δφ = -π/4  → 10   (region -π/2 .. 0)
 
-_RRC_CACHE: np.ndarray = None  # type: ignore
-
-
-def _rrc_taps(sps: int = 2, alpha: float = 0.35, ntaps: int = 11) -> np.ndarray:
-    """Root-raised-cosine filter taps (TETRA spec: alpha=0.35)."""
-    half = ntaps // 2
-    n = np.arange(-half, half + 1, dtype=float)
-    h = np.empty(len(n))
-    for i, nn in enumerate(n):
-        t = nn / sps
-        if t == 0.0:
-            h[i] = 1.0 - alpha + 4.0 * alpha / np.pi
-        elif abs(abs(t) - 1.0 / (4.0 * alpha)) < 1e-9:
-            h[i] = (alpha / np.sqrt(2.0)) * (
-                (1.0 + 2.0 / np.pi) * np.sin(np.pi / (4.0 * alpha))
-                + (1.0 - 2.0 / np.pi) * np.cos(np.pi / (4.0 * alpha))
-            )
-        else:
-            h[i] = (
-                np.sin(np.pi * t * (1.0 - alpha))
-                + 4.0 * alpha * t * np.cos(np.pi * t * (1.0 + alpha))
-            ) / (np.pi * t * (1.0 - (4.0 * alpha * t) ** 2))
-    h /= np.sqrt(np.dot(h, h))
-    return h.astype(np.float32)
-
-
-def _demod_pi4dqpsk(iq: np.ndarray, prev_sym: complex) -> tuple:
-    """
-    Pi/4-DQPSK demodulation.
-    iq: complex64, 2 samples/symbol
-    Returns: (bytes with one bit/byte, updated prev_sym)
-
-    ETSI EN 300 392-2 Table 8.2 Gray mapping:
-      Δφ = +π/4  → 00    (region  0..π/2)
-      Δφ = +3π/4 → 01    (region  π/2..π)
-      Δφ = -3π/4 → 11    (region -π..-π/2)
-      Δφ = -π/4  → 10    (region -π/2..0)
-    """
-    global _RRC_CACHE
-    if _RRC_CACHE is None:
-        _RRC_CACHE = _rrc_taps()
-
-    SPS = 2
-    if len(iq) < SPS:
-        return b'', prev_sym
-
-    filtered = np.convolve(iq, _RRC_CACHE, mode='same')
-
-    n_syms = len(filtered) // SPS
-    if n_syms == 0:
-        return b'', prev_sym
-
-    # For each symbol period pick the sample with highest amplitude
-    mat = filtered[:n_syms * SPS].reshape(n_syms, SPS)
-    pick = np.argmax(np.abs(mat), axis=1)
-    symbols = mat[np.arange(n_syms), pick]
-
-    # Differential phase detection
-    chain = np.empty(n_syms + 1, dtype=np.complex64)
-    chain[0] = prev_sym
-    chain[1:] = symbols
-    phase_diff = np.angle(chain[1:] * np.conj(chain[:-1]))
-
-    # Vectorised decision
-    bits = np.empty(n_syms * 2, dtype=np.uint8)
-    b0 = (phase_diff < 0).astype(np.uint8)        # MSB: 1 for negative Δφ
-    b1 = (np.abs(phase_diff) > np.pi / 2).astype(np.uint8)  # LSB: 1 for ±3π/4
-    bits[0::2] = b0
-    bits[1::2] = b1
-
-    return bits.tobytes(), complex(symbols[-1])
+_PI_2 = math.pi / 2
 
 
 def _run_demod(src_fd: int, sink_fd: int, stop_event: threading.Event) -> None:
     """
-    Read complex float32 IQ from src_fd, demodulate pi/4-DQPSK with numpy,
+    Read complex float32 IQ from src_fd, demodulate pi/4-DQPSK,
     write one-bit-per-byte stream to sink_fd (tetra-rx stdin).
-    src_fd is a dup of stdin so Python's BufferedReader is never touched.
+    src_fd is a dup of fd 0 so Python's BufferedReader is never touched.
     """
-    BYTES_PER_SAMPLE = 8        # complex64 = 2 × float32
-    CHUNK_SAMPLES    = 4096
-    CHUNK_BYTES      = CHUNK_SAMPLES * BYTES_PER_SAMPLE
+    BYTES_PER_SAMPLE = 8        # complex64 = 2 × float32 = 8 bytes
+    CHUNK_BYTES      = 4096 * BYTES_PER_SAMPLE
 
-    prev_sym = complex(1.0, 0.0)
+    prev_re = 1.0
+    prev_im = 0.0
     buf = b''
 
     try:
@@ -496,17 +432,54 @@ def _run_demod(src_fd: int, sink_fd: int, stop_event: threading.Event) -> None:
                 break
 
             buf += data
-            n_complete = (len(buf) // BYTES_PER_SAMPLE) * BYTES_PER_SAMPLE
-            if n_complete == 0:
+
+            # Process complete IQ pairs (each pair = one symbol at 2 sps)
+            # One symbol = 2 samples × 8 bytes = 16 bytes
+            BYTES_PER_SYMBOL = BYTES_PER_SAMPLE * 2
+            n_syms = len(buf) // BYTES_PER_SYMBOL
+            if n_syms == 0:
                 continue
 
-            iq = np.frombuffer(buf[:n_complete], dtype=np.complex64).copy()
-            buf = buf[n_complete:]
+            bits = bytearray()
+            offset = 0
+            for _ in range(n_syms):
+                # Sample 0
+                re0, im0 = struct.unpack_from('<ff', buf, offset)
+                offset += BYTES_PER_SAMPLE
+                # Sample 1
+                re1, im1 = struct.unpack_from('<ff', buf, offset)
+                offset += BYTES_PER_SAMPLE
 
-            bits, prev_sym = _demod_pi4dqpsk(iq, prev_sym)
+                # Pick sample with higher amplitude (max-power timing)
+                if re0 * re0 + im0 * im0 >= re1 * re1 + im1 * im1:
+                    re_s, im_s = re0, im0
+                else:
+                    re_s, im_s = re1, im1
+
+                # Differential phase: angle(s[n] * conj(s[n-1]))
+                pd = math.atan2(
+                    im_s * prev_re - re_s * prev_im,
+                    re_s * prev_re + im_s * prev_im,
+                )
+
+                if pd >= 0:
+                    if pd < _PI_2:
+                        bits.append(0); bits.append(0)   # +π/4
+                    else:
+                        bits.append(0); bits.append(1)   # +3π/4
+                else:
+                    if pd >= -_PI_2:
+                        bits.append(1); bits.append(0)   # -π/4
+                    else:
+                        bits.append(1); bits.append(1)   # -3π/4
+
+                prev_re, prev_im = re_s, im_s
+
+            buf = buf[offset:]
+
             if bits:
                 try:
-                    os.write(sink_fd, bits)
+                    os.write(sink_fd, bytes(bits))
                 except OSError:
                     break
 

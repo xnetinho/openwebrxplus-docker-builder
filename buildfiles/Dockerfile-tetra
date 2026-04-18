@@ -12,9 +12,6 @@ RUN --mount=type=cache,id=owrxp-tetra-buildcache,target=/build_cache \
 # Stage 2: runtime — extends the softmbe image already on Docker Hub
 FROM slechev/openwebrxplus-softmbe:latest
 
-# Verify numpy is available (required for the pi/4-DQPSK demodulator)
-RUN python3 -c "import numpy; print('numpy', numpy.__version__, 'present')"
-
 # Compiled binaries from stage 1
 COPY --from=tetra-builder /build_artifacts/tetra/ /tmp/tetra_files/
 

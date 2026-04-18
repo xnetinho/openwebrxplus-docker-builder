@@ -15,7 +15,6 @@ apt-get install -y --no-install-recommends libosmocore
 apt-get clean
 rm -rf /var/lib/apt/lists/*
 
-python3 -c "import numpy; print('  numpy', numpy.__version__, 'confirmed for DQPSK demodulator')"
 
 # ── 1. Binaries and scripts ───────────────────────────────────────────────────
 pinfo "Installing TETRA binaries..."
