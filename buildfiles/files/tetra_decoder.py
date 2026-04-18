@@ -554,13 +554,25 @@ def main() -> None:
     # Pipe: demodulated bits (one bit/byte) → tetra-rx stdin
     gn_r, gn_w = os.pipe()
 
+    # TETMON UDP port is configured via env var, not a CLI flag.
+    tetra_env = dict(os.environ)
+    tetra_env["TETRA_HACK_PORT"] = str(TETMON_PORT)
+    tetra_env["TETRA_HACK_IP"]   = "127.0.0.1"
+
     tetra_rx = subprocess.Popen(
-        [TETRA_RX, "-t", str(TETMON_PORT)],
+        [TETRA_RX],
         stdin=gn_r,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        env=tetra_env,
     )
     os.close(gn_r)
+
+    # Log tetra-rx stderr in background so errors are visible
+    def _log_tetra_stderr():
+        for line in tetra_rx.stderr:
+            logger.debug("tetra-rx: %s", line.decode("utf-8", errors="replace").rstrip())
+    threading.Thread(target=_log_tetra_stderr, daemon=True, name="tetra-rx-log").start()
 
     audio = _AudioPipeline()
     audio.start()
@@ -583,7 +595,7 @@ def main() -> None:
                 break
             ready, _, _ = select.select([tetra_rx.stdout], [], [], 0.02)
             if ready:
-                chunk = tetra_rx.stdout.read(FRAME_BYTES)
+                chunk = os.read(tetra_rx.stdout.fileno(), FRAME_BYTES)
                 if not chunk:
                     break
                 buf += chunk
