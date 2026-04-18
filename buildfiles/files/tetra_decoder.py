@@ -6,23 +6,19 @@ stdout: 16-bit signed LE PCM at 8 kHz mono
 stderr: JSON metadata lines (one object per line)
 
 Pipeline:
-  stdin IQ → pi/4-DQPSK demod → tetra-rx → cdecoder | sdecoder → stdout PCM
-                                     |
-                               TETMON UDP:7379 → JSON → stderr
-
-Author: adapted from mbbrzoza/OpenWebRX-Tetra-Plugin and trollminer/OpenWebRX-Tetra-Plugin
+  stdin IQ → tetra-rx -i (built-in float_to_bits demod + pseudo-AFC)
+                 └→ TETMON UDP:7379 → JSON metadata → stderr
+                 └→ TETMON UDP:7379 → TRA: audio → sdecoder → stdout PCM
 """
 
 import json
 import logging
-import math
 import os
 import queue
 import re
 import select
 import signal
 import socket
-import struct
 import subprocess
 import sys
 import threading
@@ -35,8 +31,6 @@ TETRA_RX = "/opt/openwebrx-tetra/tetra-rx"
 CDECODER = "/opt/openwebrx-tetra/cdecoder"
 SDECODER = "/opt/openwebrx-tetra/sdecoder"
 
-INPUT_RATE  = 36000
-OUTPUT_RATE = 8000
 FRAME_BYTES = 1380
 PCM_BYTES   = 960
 SILENCE     = b"\x00" * PCM_BYTES
@@ -114,7 +108,6 @@ def _parse_tetmon(data: bytes) -> None:
     try:
         text = data.decode("utf-8", errors="replace")
 
-        # Prefer TETMON_begin/TETMON_end delimited payload
         begin = text.find("TETMON_begin")
         if begin >= 0:
             end = text.find("TETMON_end", begin)
@@ -125,7 +118,6 @@ def _parse_tetmon(data: bytes) -> None:
                 return
             payload = text[fp:]
 
-        # FUNC may be multi-word (e.g. "D-TX GRANTED", "D-CONNECT ACK")
         func_m = re.search(
             r'FUNC:((?:\S+)(?:\s+(?!(?:SSI|IDX|MCC|MNC|DL|UL|CC|CRYPT|CALLID|CID|LA|ENCMODE|STATUS|AFC|RATE|MSG)\s*:)\S+)*)',
             payload,
@@ -135,13 +127,11 @@ def _parse_tetmon(data: bytes) -> None:
         func = func_m.group(1).strip().upper()
         p = payload
 
-        # ── NETINFO1 ──────────────────────────────────────────────────────────
         if func == "NETINFO1":
             if not _rate_ok("netinfo"):
                 return
             mcc = _field(p, "MCC", "?")
             mnc = _field(p, "MNC", "?")
-            # Some firmware sends MCC/MNC as hex
             try:
                 mcc = str(int(mcc, 16)) if not mcc.isdigit() else mcc
             except Exception:
@@ -161,7 +151,6 @@ def _parse_tetmon(data: bytes) -> None:
                 "encrypted": (_field(p, "CRYPT", "0") != "0"),
             })
 
-        # ── FREQINFO1 ─────────────────────────────────────────────────────────
         elif func == "FREQINFO1":
             if not _rate_ok("freqinfo"):
                 return
@@ -171,7 +160,6 @@ def _parse_tetmon(data: bytes) -> None:
                 "ul_freq": _field(p, "UL") or _field(p, "ULF", ""),
             })
 
-        # ── ENCINFO1 ──────────────────────────────────────────────────────────
         elif func == "ENCINFO1":
             if not _rate_ok("encinfo"):
                 return
@@ -181,7 +169,6 @@ def _parse_tetmon(data: bytes) -> None:
                 "enc_mode": _enc_mode_str(_field(p, "ENCMODE", "0")),
             })
 
-        # ── D-SETUP ───────────────────────────────────────────────────────────
         elif func in ("DSETUPDEC", "D-SETUP"):
             if not _rate_ok("call"):
                 return
@@ -195,7 +182,6 @@ def _parse_tetmon(data: bytes) -> None:
                 "encrypted": (_field(p, "CRYPT", "0") != "0"),
             })
 
-        # ── D-CONNECT ─────────────────────────────────────────────────────────
         elif func in ("DCONNECTDEC", "D-CONNECT", "D-CONNECT ACK"):
             if not _rate_ok("call"):
                 return
@@ -209,7 +195,6 @@ def _parse_tetmon(data: bytes) -> None:
                 "encrypted": (_field(p, "CRYPT", "0") != "0"),
             })
 
-        # ── D-TX GRANTED ──────────────────────────────────────────────────────
         elif func in ("DTXGRANTDEC", "D-TX-GRANTED", "D-TX GRANTED"):
             if not _rate_ok("call"):
                 return
@@ -223,7 +208,6 @@ def _parse_tetmon(data: bytes) -> None:
                 "encrypted": (_field(p, "CRYPT", "0") != "0"),
             })
 
-        # ── D-RELEASE ─────────────────────────────────────────────────────────
         elif func in ("DRELEASEDEC", "D-RELEASE"):
             if not _rate_ok("release"):
                 return
@@ -233,7 +217,6 @@ def _parse_tetmon(data: bytes) -> None:
                 "call_id": _field(p, "CALLID") or _field(p, "CID", ""),
             })
 
-        # ── D-STATUS ──────────────────────────────────────────────────────────
         elif func == "DSTATUSDEC":
             if not _rate_ok("status"):
                 return
@@ -249,7 +232,6 @@ def _parse_tetmon(data: bytes) -> None:
                 "status": status,
             })
 
-        # ── SDS (Short Data Service) ──────────────────────────────────────────
         elif func == "SDSDEC":
             if not _rate_ok("sds"):
                 return
@@ -261,7 +243,6 @@ def _parse_tetmon(data: bytes) -> None:
                 "text": msg_m.group(1).strip() if msg_m else "",
             })
 
-        # ── BURST ─────────────────────────────────────────────────────────────
         elif func == "BURST":
             if not _rate_ok("burst"):
                 return
@@ -294,7 +275,7 @@ def _tetmon_listener(
     while not stop_event.is_set():
         try:
             data, _ = sock.recvfrom(4096)
-            # Audio frame: contains TRA: marker followed by raw ACELP data
+            # Audio frame: TRA: marker followed by raw ACELP data
             tra_pos = data.find(b"TRA:")
             if tra_pos >= 0:
                 frame = data[tra_pos + 4 : tra_pos + 4 + FRAME_BYTES]
@@ -318,10 +299,8 @@ def _tetmon_listener(
 class _AudioPipeline:
     """
     TETMON audio path: TRA: frames (already channel-decoded by tetra-rx) go
-    directly to sdecoder.  cdecoder is the channel decoder and is NOT needed.
-
-    sdecoder/cdecoder require filename args — use /dev/stdin /dev/stdout so
-    they read/write through the pipes we hand them as fd 0/1.
+    directly to sdecoder.  sdecoder requires filename args — use
+    /dev/stdin /dev/stdout so it reads/writes through the subprocess pipes.
     """
 
     def __init__(self):
@@ -380,151 +359,6 @@ class _AudioPipeline:
                 self._decoder = None
 
 
-# ── Pi/4-DQPSK demodulator ────────────────────────────────────────────────────
-#
-# TETRA: pi/4-DQPSK, 18 kBaud, 2 sps at 36 kS/s, alpha=0.35 RRC.
-# Output: one bit per byte (0 or 1) → tetra-rx stdin.
-# ETSI EN 300 392-2 Table 8.2 Gray mapping:
-#   Δφ = +π/4  → 00,  +3π/4 → 01,  -3π/4 → 11,  -π/4 → 10
-
-try:
-    import numpy as _np
-    _HAS_NUMPY = True
-except ImportError:
-    _HAS_NUMPY = False
-    logger.warning("numpy not available — using pure-Python demodulator (no RRC filter)")
-
-_PI_2 = math.pi / 2
-_RRC_TAPS = None   # cached numpy array
-
-
-def _build_rrc(sps: int = 2, alpha: float = 0.35, ntaps: int = 11):
-    """Root-raised-cosine taps for TETRA (alpha=0.35, 2 sps)."""
-    half = ntaps // 2
-    h = _np.empty(ntaps + 1)
-    for i, nn in enumerate(range(-half, half + 1)):
-        t = nn / sps
-        if t == 0.0:
-            h[i] = 1.0 - alpha + 4.0 * alpha / _np.pi
-        elif abs(abs(t) - 1.0 / (4.0 * alpha)) < 1e-9:
-            h[i] = (alpha / _np.sqrt(2.0)) * (
-                (1.0 + 2.0 / _np.pi) * _np.sin(_np.pi / (4.0 * alpha))
-                + (1.0 - 2.0 / _np.pi) * _np.cos(_np.pi / (4.0 * alpha))
-            )
-        else:
-            h[i] = (
-                _np.sin(_np.pi * t * (1.0 - alpha))
-                + 4.0 * alpha * t * _np.cos(_np.pi * t * (1.0 + alpha))
-            ) / (_np.pi * t * (1.0 - (4.0 * alpha * t) ** 2))
-    h /= _np.sqrt(_np.dot(h, h))
-    return h.astype(_np.float32)
-
-
-def _demod_numpy(iq: "_np.ndarray", prev: complex) -> tuple:
-    """Numpy pi/4-DQPSK demod with RRC matched filter."""
-    global _RRC_TAPS
-    if _RRC_TAPS is None:
-        _RRC_TAPS = _build_rrc()
-    SPS = 2
-    filtered = _np.convolve(iq, _RRC_TAPS, mode='same')
-    n = len(filtered) // SPS
-    if n == 0:
-        return b'', prev
-    mat = filtered[:n * SPS].reshape(n, SPS)
-    syms = mat[_np.arange(n), _np.argmax(_np.abs(mat), axis=1)]
-    chain = _np.empty(n + 1, dtype=_np.complex64)
-    chain[0] = prev
-    chain[1:] = syms
-    pd = _np.angle(chain[1:] * _np.conj(chain[:-1]))
-    b0 = (pd < 0).astype(_np.uint8)
-    b1 = (_np.abs(pd) > _np.pi / 2).astype(_np.uint8)
-    bits = _np.empty(n * 2, dtype=_np.uint8)
-    bits[0::2] = b0
-    bits[1::2] = b1
-    return bits.tobytes(), complex(syms[-1])
-
-
-def _demod_py(buf: bytes, prev_re: float, prev_im: float) -> tuple:
-    """Pure-Python pi/4-DQPSK demod (no RRC, stdlib only)."""
-    BPS = 8   # bytes per complex64 sample
-    n_syms = len(buf) // (BPS * 2)
-    bits = bytearray()
-    off = 0
-    for _ in range(n_syms):
-        re0, im0 = struct.unpack_from('<ff', buf, off);     off += BPS
-        re1, im1 = struct.unpack_from('<ff', buf, off);     off += BPS
-        if re0*re0 + im0*im0 >= re1*re1 + im1*im1:
-            re_s, im_s = re0, im0
-        else:
-            re_s, im_s = re1, im1
-        pd = math.atan2(im_s*prev_re - re_s*prev_im, re_s*prev_re + im_s*prev_im)
-        if pd >= 0:
-            bits += b'\x00\x00' if pd < _PI_2 else b'\x00\x01'
-        else:
-            bits += b'\x01\x00' if pd >= -_PI_2 else b'\x01\x01'
-        prev_re, prev_im = re_s, im_s
-    return bytes(bits), prev_re, prev_im
-
-
-def _run_demod(src_fd: int, sink_fd: int, stop_event: threading.Event) -> None:
-    """
-    Read complex float32 IQ from src_fd, demodulate pi/4-DQPSK,
-    write one-bit-per-byte to sink_fd (tetra-rx stdin).
-    src_fd is os.dup(0) — Python's BufferedReader is never touched.
-    Uses numpy+RRC when available, falls back to pure Python.
-    """
-    BPS        = 8               # bytes per complex64 sample
-    CHUNK_B    = 4096 * BPS
-    buf        = b''
-    prev_np    = complex(1.0, 0.0)
-    prev_re    = 1.0
-    prev_im    = 0.0
-
-    try:
-        while not stop_event.is_set():
-            try:
-                ready, _, _ = select.select([src_fd], [], [], 0.5)
-                if not ready:
-                    continue
-                data = os.read(src_fd, CHUNK_B)
-                if not data:
-                    break
-            except OSError:
-                break
-
-            buf += data
-
-            if _HAS_NUMPY:
-                n_samp = (len(buf) // BPS) * BPS
-                if n_samp < BPS * 2:
-                    continue
-                iq = _np.frombuffer(buf[:n_samp], dtype=_np.complex64).copy()
-                buf = buf[n_samp:]
-                bits, prev_np = _demod_numpy(iq, prev_np)
-            else:
-                n_syms = len(buf) // (BPS * 2)
-                if n_syms == 0:
-                    continue
-                use = n_syms * BPS * 2
-                bits, prev_re, prev_im = _demod_py(buf[:use], prev_re, prev_im)
-                buf = buf[use:]
-
-            if bits:
-                try:
-                    os.write(sink_fd, bits)
-                except OSError:
-                    break
-
-    except Exception as e:
-        logger.debug("demod thread error: %s", e)
-    finally:
-        for fd in (src_fd, sink_fd):
-            try:
-                os.close(fd)
-            except Exception:
-                pass
-
-
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -536,33 +370,24 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
 
-    # Duplicate stdin fd so daemon threads never touch Python's BufferedReader.
-    # This prevents the _enter_buffered_busy crash at interpreter shutdown.
-    stdin_dup = os.dup(0)
-
-    # Pipe: demodulated bits (one bit/byte) → tetra-rx stdin
-    gn_r, gn_w = os.pipe()
-
-    # TETMON UDP port is configured via env var, not a CLI flag.
     tetra_env = dict(os.environ)
     tetra_env["TETRA_HACK_PORT"] = str(TETMON_PORT)
     tetra_env["TETRA_HACK_IP"]   = "127.0.0.1"
     tetra_env["TETRA_HACK_RXID"] = "1"
 
-    # tetra-rx requires a filename argument (not stdin by default).
-    # Pass /dev/stdin as the file argument and wire gn_r as its stdin —
-    # tetra-rx opens /dev/stdin which resolves to the pipe.
-    # stdout → DEVNULL: with TETMON enabled all output (audio + metadata) goes via UDP.
+    # tetra-rx with -i reads float32 IQ directly and demodulates internally.
+    # -a: pseudo-AFC corrects small frequency offsets automatically.
+    # -e: emit metadata for encrypted calls (no audio decryption).
+    # -r -s: reassemble fragmented PDUs, display SDS as text.
+    # stdin=0: inherit parent fd 0 (the IQ pipe from OpenWebRX+).
     tetra_rx = subprocess.Popen(
-        [TETRA_RX, "/dev/stdin"],
-        stdin=gn_r,
+        [TETRA_RX, "-i", "-a", "-r", "-s", "-e", "/dev/stdin"],
+        stdin=0,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         env=tetra_env,
     )
-    os.close(gn_r)
 
-    # Log tetra-rx stderr in background so errors are visible
     def _log_tetra_stderr():
         for line in tetra_rx.stderr:
             logger.debug("tetra-rx: %s", line.decode("utf-8", errors="replace").rstrip())
@@ -571,7 +396,6 @@ def main() -> None:
     audio = _AudioPipeline()
     audio.start()
 
-    # Queue for decoded PCM frames produced by the TETMON listener thread
     pcm_queue: "queue.Queue[bytes]" = queue.Queue(maxsize=16)
 
     threading.Thread(
@@ -579,12 +403,6 @@ def main() -> None:
         daemon=True, name="tetmon",
     ).start()
 
-    # Demodulator: pi/4-DQPSK via numpy (no GNURadio required)
-    threading.Thread(
-        target=_run_demod, args=(stdin_dup, gn_w, stop_event), daemon=True, name="demod"
-    ).start()
-
-    # Main loop: drain PCM queue; emit silence while idle (keeps audio stream alive)
     last_audio = time.monotonic()
     try:
         while not stop_event.is_set():
