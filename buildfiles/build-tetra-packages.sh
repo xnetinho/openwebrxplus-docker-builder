@@ -9,7 +9,7 @@ pinfo "Installing build dependencies..."
 apt_update_with_fallback 120
 apt-get install -y --no-install-recommends \
     ca-certificates build-essential pkg-config git wget unzip \
-    gnuradio libosmocore-dev python3-dev
+    libosmocore-dev python3-dev
 
 # ── 1. Clone osmo-tetra-sq5bpf ───────────────────────────────────────────────
 pinfo "Cloning osmo-tetra-sq5bpf..."

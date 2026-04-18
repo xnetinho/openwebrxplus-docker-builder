@@ -12,6 +12,18 @@ RUN --mount=type=cache,id=owrxp-tetra-buildcache,target=/build_cache \
 # Stage 2: runtime — extends the softmbe image already on Docker Hub
 FROM slechev/openwebrxplus-softmbe:latest
 
+# Ensure GNURadio Python bindings are present for the TETRA pi/4-DQPSK demodulator.
+# The base image may already have GNURadio (check first); if not, install via apt.
+RUN python3 -c "from gnuradio import gr; print('GNURadio', gr.version(), 'already present')" 2>/dev/null \
+    || { \
+        apt-get update -qq \
+        && apt-get install -y --no-install-recommends python3-gnuradio \
+        && apt-get clean \
+        && rm -rf /var/lib/apt/lists/* \
+        && python3 -c "from gnuradio import gr; print('GNURadio', gr.version(), 'installed')" \
+        || { echo "ERROR: GNURadio not available and could not be installed"; exit 1; }; \
+    }
+
 # Compiled binaries from stage 1
 COPY --from=tetra-builder /build_artifacts/tetra/ /tmp/tetra_files/
 
