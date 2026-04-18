@@ -13,8 +13,19 @@ TETRA_RX = "/opt/openwebrx-tetra/tetra-rx"
 # ── Locate OpenWebRX+ package directory ──────────────────────────────────────
 
 try:
+    import importlib.util
     import owrx as _owrx
-    OWRX_DIR = os.path.dirname(_owrx.__file__)
+
+    if _owrx.__file__ is not None:
+        # Regular package with __init__.py
+        OWRX_DIR = os.path.dirname(_owrx.__file__)
+    else:
+        # Namespace package — __file__ is None, use submodule_search_locations
+        spec = importlib.util.find_spec("owrx")
+        if spec and spec.submodule_search_locations:
+            OWRX_DIR = list(spec.submodule_search_locations)[0]
+        else:
+            sys.exit("ERROR: Cannot locate owrx package directory")
 except ImportError:
     sys.exit("ERROR: Cannot import owrx — is OpenWebRX+ installed?")
 
