@@ -17,6 +17,7 @@ import json
 import logging
 import math
 import os
+import queue
 import re
 import select
 import signal
@@ -278,7 +279,11 @@ def _parse_tetmon(data: bytes) -> None:
 
 # ── TETMON UDP listener ───────────────────────────────────────────────────────
 
-def _tetmon_listener(stop_event: threading.Event) -> None:
+def _tetmon_listener(
+    stop_event: threading.Event,
+    audio: "_AudioPipeline",
+    pcm_queue: "queue.Queue[bytes]",
+) -> None:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
@@ -290,7 +295,18 @@ def _tetmon_listener(stop_event: threading.Event) -> None:
     while not stop_event.is_set():
         try:
             data, _ = sock.recvfrom(4096)
-            _parse_tetmon(data)
+            # Audio frame: contains TRA: marker followed by raw ACELP data
+            tra_pos = data.find(b"TRA:")
+            if tra_pos >= 0:
+                frame = data[tra_pos + 4 : tra_pos + 4 + FRAME_BYTES]
+                if len(frame) == FRAME_BYTES:
+                    pcm = audio.feed(frame)
+                    try:
+                        pcm_queue.put_nowait(pcm)
+                    except queue.Full:
+                        pass
+            else:
+                _parse_tetmon(data)
         except socket.timeout:
             continue
         except Exception as e:
@@ -558,14 +574,16 @@ def main() -> None:
     tetra_env = dict(os.environ)
     tetra_env["TETRA_HACK_PORT"] = str(TETMON_PORT)
     tetra_env["TETRA_HACK_IP"]   = "127.0.0.1"
+    tetra_env["TETRA_HACK_RXID"] = "1"
 
     # tetra-rx requires a filename argument (not stdin by default).
     # Pass /dev/stdin as the file argument and wire gn_r as its stdin —
     # tetra-rx opens /dev/stdin which resolves to the pipe.
+    # stdout → DEVNULL: with TETMON enabled all output (audio + metadata) goes via UDP.
     tetra_rx = subprocess.Popen(
         [TETRA_RX, "/dev/stdin"],
         stdin=gn_r,
-        stdout=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         env=tetra_env,
     )
@@ -580,8 +598,12 @@ def main() -> None:
     audio = _AudioPipeline()
     audio.start()
 
+    # Queue for decoded PCM frames produced by the TETMON listener thread
+    pcm_queue: "queue.Queue[bytes]" = queue.Queue(maxsize=16)
+
     threading.Thread(
-        target=_tetmon_listener, args=(stop_event,), daemon=True, name="tetmon"
+        target=_tetmon_listener, args=(stop_event, audio, pcm_queue),
+        daemon=True, name="tetmon",
     ).start()
 
     # Demodulator: pi/4-DQPSK via numpy (no GNURadio required)
@@ -589,26 +611,18 @@ def main() -> None:
         target=_run_demod, args=(stdin_dup, gn_w, stop_event), daemon=True, name="demod"
     ).start()
 
-    # Audio pump: tetra-rx stdout → codec → stdout PCM
+    # Main loop: drain PCM queue; emit silence while idle (keeps audio stream alive)
     last_audio = time.monotonic()
-    buf = b""
     try:
         while not stop_event.is_set():
             if tetra_rx.poll() is not None:
                 break
-            ready, _, _ = select.select([tetra_rx.stdout], [], [], 0.02)
-            if ready:
-                chunk = os.read(tetra_rx.stdout.fileno(), FRAME_BYTES)
-                if not chunk:
-                    break
-                buf += chunk
-                while len(buf) >= FRAME_BYTES:
-                    frame, buf = buf[:FRAME_BYTES], buf[FRAME_BYTES:]
-                    pcm = audio.feed(frame)
-                    sys.stdout.buffer.write(pcm)
-                    sys.stdout.buffer.flush()
-                    last_audio = time.monotonic()
-            else:
+            try:
+                pcm = pcm_queue.get(timeout=0.02)
+                sys.stdout.buffer.write(pcm)
+                sys.stdout.buffer.flush()
+                last_audio = time.monotonic()
+            except queue.Empty:
                 if time.monotonic() - last_audio > 0.02:
                     sys.stdout.buffer.write(SILENCE)
                     sys.stdout.buffer.flush()
