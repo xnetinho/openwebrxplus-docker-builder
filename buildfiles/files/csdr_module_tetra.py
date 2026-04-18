@@ -3,6 +3,7 @@ import logging
 import pickle
 import threading
 from csdr.module import PopenModule
+from pycsdr.types import Format
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +22,12 @@ class TetraDecoderModule(PopenModule):
         self._meta_thread = None
         self._meta_writer = None
         super().__init__()
+
+    def getInputFormat(self):
+        return Format.COMPLEX_FLOAT
+
+    def getOutputFormat(self):
+        return Format.SHORT
 
     def getCommand(self):
         return ["python3", TETRA_DECODER_SCRIPT]
