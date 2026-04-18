@@ -391,11 +391,12 @@ class _AudioPipeline:
 
 # ── GNURadio pi/4-DQPSK demodulator ──────────────────────────────────────────
 
-def _run_gnuradio(sink_fd: int, stop_event: threading.Event) -> None:
+def _run_gnuradio(src_fd: int, sink_fd: int, stop_event: threading.Event) -> None:
     """
-    Read complex float32 IQ from stdin, demodulate pi/4-DQPSK, write packed
-    bits to sink_fd (the write end of the pipe connected to tetra-rx stdin).
-    TETRA: 18 kBaud, 36 kS/s → 2 samples per symbol.
+    Read complex float32 IQ from src_fd (a dup of stdin fd 0), demodulate
+    pi/4-DQPSK, write packed bits to sink_fd (pipe to tetra-rx stdin).
+    Uses a raw fd duplicate so Python's BufferedReader lock is never touched
+    by this daemon thread, avoiding the _enter_buffered_busy crash on shutdown.
     Falls back to raw IQ passthrough if GNURadio is unavailable.
     """
     try:
@@ -404,7 +405,7 @@ def _run_gnuradio(sink_fd: int, stop_event: threading.Event) -> None:
         class _DQPSK(gr.top_block):
             def __init__(self):
                 super().__init__()
-                src   = blocks.file_descriptor_source(gr.sizeof_gr_complex, 0, False)
+                src   = blocks.file_descriptor_source(gr.sizeof_gr_complex, src_fd, False)
                 demod = digital.dqpsk_demod(
                     samples_per_symbol=2,
                     gray_coded=True,
@@ -426,13 +427,23 @@ def _run_gnuradio(sink_fd: int, stop_event: threading.Event) -> None:
         logger.warning("GNURadio not available — passing raw IQ to tetra-rx (may not decode)")
         try:
             while not stop_event.is_set():
-                chunk = sys.stdin.buffer.read(4096)
-                if not chunk:
+                try:
+                    ready, _, _ = select.select([src_fd], [], [], 0.5)
+                    if not ready:
+                        continue
+                    chunk = os.read(src_fd, 4096)
+                    if not chunk:
+                        break
+                    os.write(sink_fd, chunk)
+                except OSError:
                     break
-                os.write(sink_fd, chunk)
         except Exception:
             pass
     finally:
+        try:
+            os.close(src_fd)
+        except Exception:
+            pass
         try:
             os.close(sink_fd)
         except Exception:
@@ -449,6 +460,10 @@ def main() -> None:
 
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
+
+    # Duplicate stdin fd so daemon threads never touch Python's BufferedReader.
+    # This prevents the _enter_buffered_busy crash at interpreter shutdown.
+    stdin_dup = os.dup(0)
 
     # Pipe: GNURadio packed bits → tetra-rx
     gn_r, gn_w = os.pipe()
@@ -468,9 +483,9 @@ def main() -> None:
         target=_tetmon_listener, args=(stop_event,), daemon=True, name="tetmon"
     ).start()
 
-    # GNURadio: reads stdin IQ, writes demodulated bits to gn_w
+    # GNURadio: reads from stdin_dup (raw fd), writes demodulated bits to gn_w
     threading.Thread(
-        target=_run_gnuradio, args=(gn_w, stop_event), daemon=True, name="gnuradio"
+        target=_run_gnuradio, args=(stdin_dup, gn_w, stop_event), daemon=True, name="gnuradio"
     ).start()
 
     # Audio pump: tetra-rx stdout → codec → stdout PCM
