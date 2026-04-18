@@ -391,33 +391,105 @@ class _AudioPipeline:
             self._teardown()
 
 
-# ── Pi/4-DQPSK demodulator (pure Python stdlib) ───────────────────────────────
+# ── Pi/4-DQPSK demodulator ────────────────────────────────────────────────────
 #
-# TETRA: pi/4-DQPSK, 18 kBaud, 2 samples/symbol at 36 kS/s.
-# No external dependencies — only struct and math.
-# Output: one bit per byte (value 0 or 1) → tetra-rx stdin.
-#
+# TETRA: pi/4-DQPSK, 18 kBaud, 2 sps at 36 kS/s, alpha=0.35 RRC.
+# Output: one bit per byte (0 or 1) → tetra-rx stdin.
 # ETSI EN 300 392-2 Table 8.2 Gray mapping:
-#   Δφ = +π/4  → 00   (region  0 .. π/2)
-#   Δφ = +3π/4 → 01   (region  π/2 .. π)
-#   Δφ = -3π/4 → 11   (region -π .. -π/2)
-#   Δφ = -π/4  → 10   (region -π/2 .. 0)
+#   Δφ = +π/4  → 00,  +3π/4 → 01,  -3π/4 → 11,  -π/4 → 10
+
+try:
+    import numpy as _np
+    _HAS_NUMPY = True
+except ImportError:
+    _HAS_NUMPY = False
+    logger.warning("numpy not available — using pure-Python demodulator (no RRC filter)")
 
 _PI_2 = math.pi / 2
+_RRC_TAPS = None   # cached numpy array
+
+
+def _build_rrc(sps: int = 2, alpha: float = 0.35, ntaps: int = 11):
+    """Root-raised-cosine taps for TETRA (alpha=0.35, 2 sps)."""
+    half = ntaps // 2
+    h = _np.empty(ntaps + 1)
+    for i, nn in enumerate(range(-half, half + 1)):
+        t = nn / sps
+        if t == 0.0:
+            h[i] = 1.0 - alpha + 4.0 * alpha / _np.pi
+        elif abs(abs(t) - 1.0 / (4.0 * alpha)) < 1e-9:
+            h[i] = (alpha / _np.sqrt(2.0)) * (
+                (1.0 + 2.0 / _np.pi) * _np.sin(_np.pi / (4.0 * alpha))
+                + (1.0 - 2.0 / _np.pi) * _np.cos(_np.pi / (4.0 * alpha))
+            )
+        else:
+            h[i] = (
+                _np.sin(_np.pi * t * (1.0 - alpha))
+                + 4.0 * alpha * t * _np.cos(_np.pi * t * (1.0 + alpha))
+            ) / (_np.pi * t * (1.0 - (4.0 * alpha * t) ** 2))
+    h /= _np.sqrt(_np.dot(h, h))
+    return h.astype(_np.float32)
+
+
+def _demod_numpy(iq: "_np.ndarray", prev: complex) -> tuple:
+    """Numpy pi/4-DQPSK demod with RRC matched filter."""
+    global _RRC_TAPS
+    if _RRC_TAPS is None:
+        _RRC_TAPS = _build_rrc()
+    SPS = 2
+    filtered = _np.convolve(iq, _RRC_TAPS, mode='same')
+    n = len(filtered) // SPS
+    if n == 0:
+        return b'', prev
+    mat = filtered[:n * SPS].reshape(n, SPS)
+    syms = mat[_np.arange(n), _np.argmax(_np.abs(mat), axis=1)]
+    chain = _np.empty(n + 1, dtype=_np.complex64)
+    chain[0] = prev
+    chain[1:] = syms
+    pd = _np.angle(chain[1:] * _np.conj(chain[:-1]))
+    b0 = (pd < 0).astype(_np.uint8)
+    b1 = (_np.abs(pd) > _np.pi / 2).astype(_np.uint8)
+    bits = _np.empty(n * 2, dtype=_np.uint8)
+    bits[0::2] = b0
+    bits[1::2] = b1
+    return bits.tobytes(), complex(syms[-1])
+
+
+def _demod_py(buf: bytes, prev_re: float, prev_im: float) -> tuple:
+    """Pure-Python pi/4-DQPSK demod (no RRC, stdlib only)."""
+    BPS = 8   # bytes per complex64 sample
+    n_syms = len(buf) // (BPS * 2)
+    bits = bytearray()
+    off = 0
+    for _ in range(n_syms):
+        re0, im0 = struct.unpack_from('<ff', buf, off);     off += BPS
+        re1, im1 = struct.unpack_from('<ff', buf, off);     off += BPS
+        if re0*re0 + im0*im0 >= re1*re1 + im1*im1:
+            re_s, im_s = re0, im0
+        else:
+            re_s, im_s = re1, im1
+        pd = math.atan2(im_s*prev_re - re_s*prev_im, re_s*prev_re + im_s*prev_im)
+        if pd >= 0:
+            bits += b'\x00\x00' if pd < _PI_2 else b'\x00\x01'
+        else:
+            bits += b'\x01\x00' if pd >= -_PI_2 else b'\x01\x01'
+        prev_re, prev_im = re_s, im_s
+    return bytes(bits), prev_re, prev_im
 
 
 def _run_demod(src_fd: int, sink_fd: int, stop_event: threading.Event) -> None:
     """
     Read complex float32 IQ from src_fd, demodulate pi/4-DQPSK,
-    write one-bit-per-byte stream to sink_fd (tetra-rx stdin).
-    src_fd is a dup of fd 0 so Python's BufferedReader is never touched.
+    write one-bit-per-byte to sink_fd (tetra-rx stdin).
+    src_fd is os.dup(0) — Python's BufferedReader is never touched.
+    Uses numpy+RRC when available, falls back to pure Python.
     """
-    BYTES_PER_SAMPLE = 8        # complex64 = 2 × float32 = 8 bytes
-    CHUNK_BYTES      = 4096 * BYTES_PER_SAMPLE
-
-    prev_re = 1.0
-    prev_im = 0.0
-    buf = b''
+    BPS        = 8               # bytes per complex64 sample
+    CHUNK_B    = 4096 * BPS
+    buf        = b''
+    prev_np    = complex(1.0, 0.0)
+    prev_re    = 1.0
+    prev_im    = 0.0
 
     try:
         while not stop_event.is_set():
@@ -425,7 +497,7 @@ def _run_demod(src_fd: int, sink_fd: int, stop_event: threading.Event) -> None:
                 ready, _, _ = select.select([src_fd], [], [], 0.5)
                 if not ready:
                     continue
-                data = os.read(src_fd, CHUNK_BYTES)
+                data = os.read(src_fd, CHUNK_B)
                 if not data:
                     break
             except OSError:
@@ -433,67 +505,35 @@ def _run_demod(src_fd: int, sink_fd: int, stop_event: threading.Event) -> None:
 
             buf += data
 
-            # Process complete IQ pairs (each pair = one symbol at 2 sps)
-            # One symbol = 2 samples × 8 bytes = 16 bytes
-            BYTES_PER_SYMBOL = BYTES_PER_SAMPLE * 2
-            n_syms = len(buf) // BYTES_PER_SYMBOL
-            if n_syms == 0:
-                continue
-
-            bits = bytearray()
-            offset = 0
-            for _ in range(n_syms):
-                # Sample 0
-                re0, im0 = struct.unpack_from('<ff', buf, offset)
-                offset += BYTES_PER_SAMPLE
-                # Sample 1
-                re1, im1 = struct.unpack_from('<ff', buf, offset)
-                offset += BYTES_PER_SAMPLE
-
-                # Pick sample with higher amplitude (max-power timing)
-                if re0 * re0 + im0 * im0 >= re1 * re1 + im1 * im1:
-                    re_s, im_s = re0, im0
-                else:
-                    re_s, im_s = re1, im1
-
-                # Differential phase: angle(s[n] * conj(s[n-1]))
-                pd = math.atan2(
-                    im_s * prev_re - re_s * prev_im,
-                    re_s * prev_re + im_s * prev_im,
-                )
-
-                if pd >= 0:
-                    if pd < _PI_2:
-                        bits.append(0); bits.append(0)   # +π/4
-                    else:
-                        bits.append(0); bits.append(1)   # +3π/4
-                else:
-                    if pd >= -_PI_2:
-                        bits.append(1); bits.append(0)   # -π/4
-                    else:
-                        bits.append(1); bits.append(1)   # -3π/4
-
-                prev_re, prev_im = re_s, im_s
-
-            buf = buf[offset:]
+            if _HAS_NUMPY:
+                n_samp = (len(buf) // BPS) * BPS
+                if n_samp < BPS * 2:
+                    continue
+                iq = _np.frombuffer(buf[:n_samp], dtype=_np.complex64).copy()
+                buf = buf[n_samp:]
+                bits, prev_np = _demod_numpy(iq, prev_np)
+            else:
+                n_syms = len(buf) // (BPS * 2)
+                if n_syms == 0:
+                    continue
+                use = n_syms * BPS * 2
+                bits, prev_re, prev_im = _demod_py(buf[:use], prev_re, prev_im)
+                buf = buf[use:]
 
             if bits:
                 try:
-                    os.write(sink_fd, bytes(bits))
+                    os.write(sink_fd, bits)
                 except OSError:
                     break
 
     except Exception as e:
         logger.debug("demod thread error: %s", e)
     finally:
-        try:
-            os.close(src_fd)
-        except Exception:
-            pass
-        try:
-            os.close(sink_fd)
-        except Exception:
-            pass
+        for fd in (src_fd, sink_fd):
+            try:
+                os.close(fd)
+            except Exception:
+                pass
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
