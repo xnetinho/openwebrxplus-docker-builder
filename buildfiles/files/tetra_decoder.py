@@ -20,10 +20,13 @@ import re
 import select
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import threading
 import time
+
+import numpy as np
 
 logging.basicConfig(level=logging.WARNING, format="%(name)s: %(message)s")
 logger = logging.getLogger("tetra_decoder")
@@ -389,57 +392,126 @@ class _AudioPipeline:
             self._teardown()
 
 
-# ── GNURadio pi/4-DQPSK demodulator ──────────────────────────────────────────
+# ── Pi/4-DQPSK demodulator (numpy) ───────────────────────────────────────────
+#
+# TETRA: pi/4-DQPSK, 18 kBaud, 2 samples/symbol at 36 kS/s, alpha=0.35 RRC.
+# Output: one bit per byte (value 0 or 1) → tetra-rx stdin.
 
-def _run_gnuradio(src_fd: int, sink_fd: int, stop_event: threading.Event) -> None:
+_RRC_CACHE: np.ndarray = None  # type: ignore
+
+
+def _rrc_taps(sps: int = 2, alpha: float = 0.35, ntaps: int = 11) -> np.ndarray:
+    """Root-raised-cosine filter taps (TETRA spec: alpha=0.35)."""
+    half = ntaps // 2
+    n = np.arange(-half, half + 1, dtype=float)
+    h = np.empty(len(n))
+    for i, nn in enumerate(n):
+        t = nn / sps
+        if t == 0.0:
+            h[i] = 1.0 - alpha + 4.0 * alpha / np.pi
+        elif abs(abs(t) - 1.0 / (4.0 * alpha)) < 1e-9:
+            h[i] = (alpha / np.sqrt(2.0)) * (
+                (1.0 + 2.0 / np.pi) * np.sin(np.pi / (4.0 * alpha))
+                + (1.0 - 2.0 / np.pi) * np.cos(np.pi / (4.0 * alpha))
+            )
+        else:
+            h[i] = (
+                np.sin(np.pi * t * (1.0 - alpha))
+                + 4.0 * alpha * t * np.cos(np.pi * t * (1.0 + alpha))
+            ) / (np.pi * t * (1.0 - (4.0 * alpha * t) ** 2))
+    h /= np.sqrt(np.dot(h, h))
+    return h.astype(np.float32)
+
+
+def _demod_pi4dqpsk(iq: np.ndarray, prev_sym: complex) -> tuple:
     """
-    Read complex float32 IQ from src_fd (a dup of stdin fd 0), demodulate
-    pi/4-DQPSK, write packed bits to sink_fd (pipe to tetra-rx stdin).
-    Uses a raw fd duplicate so Python's BufferedReader lock is never touched
-    by this daemon thread, avoiding the _enter_buffered_busy crash on shutdown.
-    Falls back to raw IQ passthrough if GNURadio is unavailable.
+    Pi/4-DQPSK demodulation.
+    iq: complex64, 2 samples/symbol
+    Returns: (bytes with one bit/byte, updated prev_sym)
+
+    ETSI EN 300 392-2 Table 8.2 Gray mapping:
+      Δφ = +π/4  → 00    (region  0..π/2)
+      Δφ = +3π/4 → 01    (region  π/2..π)
+      Δφ = -3π/4 → 11    (region -π..-π/2)
+      Δφ = -π/4  → 10    (region -π/2..0)
     """
+    global _RRC_CACHE
+    if _RRC_CACHE is None:
+        _RRC_CACHE = _rrc_taps()
+
+    SPS = 2
+    if len(iq) < SPS:
+        return b'', prev_sym
+
+    filtered = np.convolve(iq, _RRC_CACHE, mode='same')
+
+    n_syms = len(filtered) // SPS
+    if n_syms == 0:
+        return b'', prev_sym
+
+    # For each symbol period pick the sample with highest amplitude
+    mat = filtered[:n_syms * SPS].reshape(n_syms, SPS)
+    pick = np.argmax(np.abs(mat), axis=1)
+    symbols = mat[np.arange(n_syms), pick]
+
+    # Differential phase detection
+    chain = np.empty(n_syms + 1, dtype=np.complex64)
+    chain[0] = prev_sym
+    chain[1:] = symbols
+    phase_diff = np.angle(chain[1:] * np.conj(chain[:-1]))
+
+    # Vectorised decision
+    bits = np.empty(n_syms * 2, dtype=np.uint8)
+    b0 = (phase_diff < 0).astype(np.uint8)        # MSB: 1 for negative Δφ
+    b1 = (np.abs(phase_diff) > np.pi / 2).astype(np.uint8)  # LSB: 1 for ±3π/4
+    bits[0::2] = b0
+    bits[1::2] = b1
+
+    return bits.tobytes(), complex(symbols[-1])
+
+
+def _run_demod(src_fd: int, sink_fd: int, stop_event: threading.Event) -> None:
+    """
+    Read complex float32 IQ from src_fd, demodulate pi/4-DQPSK with numpy,
+    write one-bit-per-byte stream to sink_fd (tetra-rx stdin).
+    src_fd is a dup of stdin so Python's BufferedReader is never touched.
+    """
+    BYTES_PER_SAMPLE = 8        # complex64 = 2 × float32
+    CHUNK_SAMPLES    = 4096
+    CHUNK_BYTES      = CHUNK_SAMPLES * BYTES_PER_SAMPLE
+
+    prev_sym = complex(1.0, 0.0)
+    buf = b''
+
     try:
-        from gnuradio import gr, blocks, digital  # type: ignore
-
-        class _DQPSK(gr.top_block):
-            def __init__(self):
-                super().__init__()
-                src   = blocks.file_descriptor_source(gr.sizeof_gr_complex, src_fd, False)
-                demod = digital.dqpsk_demod(
-                    samples_per_symbol=2,
-                    gray_coded=True,
-                    verbose=False,
-                    log=False,
-                )
-                pack = blocks.pack_k_bits_bb(8)
-                sink = blocks.file_descriptor_sink(gr.sizeof_char, sink_fd)
-                self.connect(src, demod, pack, sink)
-
-        tb = _DQPSK()
-        tb.start()
         while not stop_event.is_set():
-            time.sleep(0.1)
-        tb.stop()
-        tb.wait()
+            try:
+                ready, _, _ = select.select([src_fd], [], [], 0.5)
+                if not ready:
+                    continue
+                data = os.read(src_fd, CHUNK_BYTES)
+                if not data:
+                    break
+            except OSError:
+                break
 
-    except Exception as _gr_err:
-        logger.warning("GNURadio unavailable (%s: %s) — passing raw IQ to tetra-rx (will not decode properly)",
-                       type(_gr_err).__name__, _gr_err)
-        try:
-            while not stop_event.is_set():
+            buf += data
+            n_complete = (len(buf) // BYTES_PER_SAMPLE) * BYTES_PER_SAMPLE
+            if n_complete == 0:
+                continue
+
+            iq = np.frombuffer(buf[:n_complete], dtype=np.complex64).copy()
+            buf = buf[n_complete:]
+
+            bits, prev_sym = _demod_pi4dqpsk(iq, prev_sym)
+            if bits:
                 try:
-                    ready, _, _ = select.select([src_fd], [], [], 0.5)
-                    if not ready:
-                        continue
-                    chunk = os.read(src_fd, 4096)
-                    if not chunk:
-                        break
-                    os.write(sink_fd, chunk)
+                    os.write(sink_fd, bits)
                 except OSError:
                     break
-        except Exception:
-            pass
+
+    except Exception as e:
+        logger.debug("demod thread error: %s", e)
     finally:
         try:
             os.close(src_fd)
@@ -466,7 +538,7 @@ def main() -> None:
     # This prevents the _enter_buffered_busy crash at interpreter shutdown.
     stdin_dup = os.dup(0)
 
-    # Pipe: GNURadio packed bits → tetra-rx
+    # Pipe: demodulated bits (one bit/byte) → tetra-rx stdin
     gn_r, gn_w = os.pipe()
 
     tetra_rx = subprocess.Popen(
@@ -484,9 +556,9 @@ def main() -> None:
         target=_tetmon_listener, args=(stop_event,), daemon=True, name="tetmon"
     ).start()
 
-    # GNURadio: reads from stdin_dup (raw fd), writes demodulated bits to gn_w
+    # Demodulator: pi/4-DQPSK via numpy (no GNURadio required)
     threading.Thread(
-        target=_run_gnuradio, args=(stdin_dup, gn_w, stop_event), daemon=True, name="gnuradio"
+        target=_run_demod, args=(stdin_dup, gn_w, stop_event), daemon=True, name="demod"
     ).start()
 
     # Audio pump: tetra-rx stdout → codec → stdout PCM

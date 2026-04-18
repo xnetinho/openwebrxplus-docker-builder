@@ -15,9 +15,7 @@ apt-get install -y --no-install-recommends libosmocore
 apt-get clean
 rm -rf /var/lib/apt/lists/*
 
-# GNURadio is guaranteed by the Dockerfile RUN step before this script.
-python3 -c "from gnuradio import gr; print('  GNURadio', gr.version(), 'confirmed')" \
-    || { perror "GNURadio not importable — TETRA pi/4-DQPSK demodulation will not work"; }
+python3 -c "import numpy; print('  numpy', numpy.__version__, 'confirmed for DQPSK demodulator')"
 
 # ── 1. Binaries and scripts ───────────────────────────────────────────────────
 pinfo "Installing TETRA binaries..."
