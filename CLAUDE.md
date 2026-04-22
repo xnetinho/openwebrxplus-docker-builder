@@ -1,6 +1,4 @@
-# CLAUDE.md — Guia de Desenvolvimento
-
-Fork de [0xAF/openwebrxplus-docker-builder](https://github.com/0xAF/openwebrxplus-docker-builder) que adiciona decodificação TETRA ao OpenWebRX+.
+# CLAUDE.md — OpenWebRX+ TETRA Docker Builder
 
 Cadeia de imagens Docker:
 ```
@@ -22,7 +20,8 @@ buildfiles/
     patch_tetra.py               # Patcha OpenWebRX+ em build time
     csdr_chain_tetra.py          # CSDR chain (input: IQ 36kS/s, output: PCM 8kHz)
     csdr_module_tetra.py         # Wrapper PopenModule para tetra_decoder.py
-    tetra_decoder.py             # Pipeline: DQPSK demod + tetra-rx + áudio
+    tetra_decoder.py             # Pipeline: demod + tetra-rx + codec
+    tetra_demod.py               # Demodulador GNURadio pi/4-DQPSK
 ```
 
 ---
@@ -35,36 +34,48 @@ OpenWebRX+ → complex float32 IQ @ 36 kS/s
 TetraDecoderModule (PopenModule) → stdin tetra_decoder.py
     ↓
 tetra_decoder.py
-  _dqpsk_demod_thread (numpy)
-    - lê IQ complex64 do stdin em blocos alinhados a 16 bytes
-    - decima por 2: z = iq[::2]  (36kS/s → 18kS/s, 1 amostra/símbolo)
-    - fase diferencial: angle(z[k] * conj(z[k-1])) / (pi/4)
-    - escreve float32 no stdin do tetra-rx via PIPE
-    ↓
-tetra-rx -i -a -r -s -e /dev/stdin
-    - -i: float_to_bits interno (quantiza floats → símbolos {-3,-1,+1,+3})
-    - -a: pseudo-AFC (corrige offset de frequência)
-    ↓
-  UDP 127.0.0.1:7379 (TETMON)
-    ├─ pacotes sem TRA: → _parse_tetmon() → JSON → stderr
-    │      → csdr_module_tetra.py lê stderr → pickle → MetaWriter → WebSocket
-    └─ pacotes com TRA: (áudio ACELP) → sdecoder → PCM → stdout
+  ├→ inicia tetra_demod.py (stdin=0, herda IQ do fd 0)
+  │     ↓
+  │   tetra_demod.py (GNURadio)
+  │     AGC → FLL → Clock Recovery (PFB/RRC) → Equalizer CMA
+  │     → Diff Phasor → Constellation Decoder → bits (1 bit/byte)
+  │     → stdout PIPE
+  │
+  ├→ inicia tetra-rx (stdin = demod.stdout)
+  │     tetra-rx -r -s -e /dev/stdin
+  │     → TETMON UDP 127.0.0.1:<porta_dinâmica>
+  │
+  ├→ UDP listener (porta dinâmica)
+  │     ├─ pacotes sem TRA: → parse_metadata_from_udp() → JSON → stderr
+  │     │      → csdr_module_tetra.py lê stderr → pickle → MetaWriter → WebSocket
+  │     └─ pacotes com TRA: (ACELP frames) → CodecPipeline (cdecoder|sdecoder) → PCM
+  │
+  └→ Main loop: PCM ou silêncio → stdout
 ```
 
-**CRÍTICO**: `tetra-rx -i` aceita floats de fase pré-demodulados (saída do
-demodulador DQPSK), NÃO IQ complexo bruto. A flag `-i` faz apenas
-`float_to_bits` internamente — a demodulação pi/4-DQPSK é responsabilidade
-do `_dqpsk_demod_thread` em `tetra_decoder.py`.
+**IMPORTANTE**: `tetra-rx` NÃO usa a flag `-i` com o demodulador GNURadio.
+A flag `-i` é para floats de fase pré-demodulados (modo numpy, removido).
+O GNURadio produz BYTES (bits descompactados, 1 bit por byte) → tetra-rx lê direto.
 
 ---
 
 ## Cadeia de Build
 
 ```bash
-./run build-tetra    # FROM slechev/openwebrxplus-softmbe (leve, recomendado)
+./run build-tetra    # FROM slechev/openwebrxplus-softmbe (recomendado)
 ./run build-softmbe  # reconstrói softmbe + encadeia tetra
 ./run build          # build completo (pesado, precisa de apt-cache)
 ```
+
+---
+
+## Dependências de Runtime
+
+| Pacote | Propósito |
+|--------|-----------|
+| `gnuradio` | Demodulador DQPSK (AGC, FLL, Clock, EQ, Constellation) |
+| `python3-numpy` | Dependência indireta do GNURadio |
+| `libosmocore` | Biblioteca base para tetra-rx |
 
 ---
 
@@ -73,47 +84,58 @@ do `_dqpsk_demod_thread` em `tetra_decoder.py`.
 Binário: [osmo-tetra-sq5bpf](https://github.com/sq5bpf/osmo-tetra-sq5bpf)
 
 ```
-tetra-rx -i -a -r -s -e /dev/stdin
-  -i   Aceita float32 por símbolo (NÃO IQ — veja abaixo)
-  -a   Pseudo-AFC (só com -i)
+tetra-rx -r -s -e /dev/stdin
   -r   Reagrupa PDUs fragmentados
   -s   SDS desconhecidos como texto
   -e   Processa chamadas encriptadas (metadados válidos, áudio não)
 ```
 
-**O que -i realmente aceita**: um float por símbolo representando a mudança
-de fase em unidades de pi/4. O pipeline correto é:
-```
-IQ (complex64) → demodulador pi/4-DQPSK → float32/símbolo → tetra-rx -i
-```
+**NÃO usar `-i` com GNURadio.** A flag `-i` aceita floats, não bits.
 
 ### Variáveis de ambiente obrigatórias
 ```python
-tetra_env["TETRA_HACK_PORT"] = "7379"
-tetra_env["TETRA_HACK_IP"]   = "127.0.0.1"
-tetra_env["TETRA_HACK_RXID"] = "1"   # CRÍTICO: atoi(NULL) = SIGSEGV sem isto
+env['TETRA_HACK_PORT'] = str(udp_port)  # porta dinâmica via find_free_port()
+env['TETRA_HACK_IP']   = '127.0.0.1'
+env['TETRA_HACK_RXID'] = '1'   # CRÍTICO: atoi(NULL) = SIGSEGV sem isto
 ```
 
 ---
 
 ## Arquivos Python
 
+### `tetra_demod.py`
+Demodulador GNURadio pi/4-DQPSK. Cadeia completa:
+1. `file_descriptor_source` (fd 0 = stdin, IQ complex float32)
+2. `feedforward_agc_cc` (AGC)
+3. `fll_band_edge_cc` (sincronização de frequência)
+4. `pfb_clock_sync_ccf` (clock recovery com filtro RRC polifásico)
+5. `linear_equalizer` (equalização adaptativa CMA)
+6. `diff_phasor_cc` (extração de fase diferencial)
+7. `constellation_decoder_cb` + `map_bb` + `unpack_k_bits_bb` (decodificação)
+8. `file_descriptor_sink` (fd 1 = stdout, bytes)
+
+AFC Probe: lê frequência do FLL, emite JSON no stderr a cada 2s.
+
 ### `tetra_decoder.py`
 Pipeline principal. Roda como subprocess do `TetraDecoderModule`.
 
-- **stdin**: IQ complex float32 @ 36 kS/s
+- **stdin**: IQ complex float32 @ 36 kS/s (via PopenModule PIPE)
 - **stdout**: PCM signed 16-bit LE @ 8 kHz
 - **stderr**: JSON metadata
 
-Threads internas:
-1. `dqpsk-demod`: lê IQ, demodula, escreve floats no tetra-rx stdin
-2. `tetmon`: escuta UDP 7379 — audio TRA: → sdecoder; outros → JSON stderr
-3. `tetra-rx-log`: loga stderr do tetra-rx
-4. Loop principal: drena PCM queue → stdout; silêncio quando vazia
+Subprocessos internos:
+1. `tetra_demod.py`: GNURadio DQPSK (stdin=0 herda IQ, stdout=PIPE → tetra-rx)
+2. `tetra-rx`: decodifica bits L1/L2/L3, emite TETMON via UDP
+3. `CodecPipeline`: cdecoder|sdecoder para frames ACELP
+
+Threads:
+1. `parse_tetra_rx_stdout`: lê stdout do tetra-rx para timeslot/call info
+2. `read_demod_stderr`: lê AFC do demodulador
+3. Loop principal: UDP listener para TETMON + emissão de metadados/PCM
 
 ### `csdr_module_tetra.py`
 Wrapper `PopenModule`. Override de `_getProcess()` adiciona `stderr=PIPE`
-(sem isso, `self.process.stderr` é None e a thread de metadados nunca inicia).
+para a thread de metadados poder ler JSON do `tetra_decoder.py`.
 
 ### `csdr_chain_tetra.py`
 Chain CSDR. `getInputSampleRate()=36000`, `getOutputSampleRate()=8000`.
@@ -127,17 +149,13 @@ Patcha três arquivos do pacote `owrx` em build time:
 
 ---
 
-## sdecoder / cdecoder
+## CodecPipeline (cdecoder | sdecoder)
 
-Codec ETSI ACELP. **Exigem dois argumentos de arquivo**:
-```python
-Popen([SDECODER, "/dev/stdin", "/dev/stdout"], stdin=PIPE, stdout=PIPE)
-```
-Sem argumentos → zombie imediato (exit 1).
-
-Frames TRA: do TETMON já saem channel-decoded → usar **só sdecoder**.
-- Entrada: 1380 bytes = 5 frames ACELP (138 × 2 bytes, bit como word 16-bit)
-- Saída: PCM signed 16-bit LE @ 8 kHz
+Pipeline persistente: `cdecoder → sdecoder`
+- **cdecoder**: channel decoding (entrada: 1380 bytes ACELP, saída: intermediate)
+- **sdecoder**: speech decoding (entrada: intermediate, saída: 960 bytes PCM)
+- Ambos requerem argumentos: `/dev/stdin /dev/stdout`
+- Sem argumentos → zombie imediato (exit 1)
 
 ---
 
@@ -150,9 +168,7 @@ TETMON_begin FUNC:<TIPO> CAMPO:valor ... TETMON_end
 Tipos: `NETINFO1`, `FREQINFO1`, `ENCINFO1`, `DSETUPDEC`, `DCONNECTDEC`,
 `DTXGRANTDEC`, `DRELEASEDEC`, `DSTATUSDEC`, `SDSDEC`, `BURST`.
 
-Audio: detectado por `b"TRA:"` no datagrama UDP.
-
-Com `TETRA_HACK_PORT` ativo, stdout do tetra-rx fica vazio → usar `stdout=DEVNULL`.
+Audio: detectado por `b"TRA:"` no datagrama UDP, seguido de header e 1380 bytes ACELP.
 
 ---
 
@@ -164,66 +180,61 @@ Com `TETRA_HACK_PORT` ativo, stdout do tetra-rx fica vazio → usar `stdout=DEVN
 | `/opt/openwebrx-tetra/sdecoder` | Decoder ACELP (fala) |
 | `/opt/openwebrx-tetra/cdecoder` | Decoder ACELP (canal) |
 | `/opt/openwebrx-tetra/tetra_decoder.py` | Pipeline Python |
+| `/opt/openwebrx-tetra/tetra_demod.py` | Demodulador GNURadio |
 | `/usr/lib/python3/dist-packages/csdr/chain/tetra.py` | CSDR chain |
-| `/usr/lib/python3/dist-packages/csdr/modules/tetra.py` | CSDR module |
+| `/usr/lib/python3/dist-packages/csdr/module/tetra.py` | CSDR module |
 
 ---
 
 ## Diagnóstico
 
 ```bash
-# Processos rodando
-ps auxw | grep -E 'tetra|sdecoder'
+# Processos rodando (todos devem ter CPU > 0 com sinal presente)
+ps auxw | grep -E 'tetra|sdecoder|cdecoder|gnuradio'
 
-# TETMON recebendo dados
-tcpdump -i lo -n udp port 7379 -A 2>/dev/null | head -20
+# GNURadio instalado?
+python3 -c 'from gnuradio import gr; print(gr.version())'
+
+# TETMON recebendo dados (usar porta do find_free_port)
+# Descobrir a porta: ss -ulnp | grep python
+tcpdump -i lo -n udp port <porta> -A 2>/dev/null | head -20
 
 # Env vars do tetra-rx
 cat /proc/<PID>/environ | tr '\0' '\n' | grep TETRA
 
-# File descriptors (stdin deve ser PIPE, não fd 0 herdado)
+# File descriptors
 ls -la /proc/<PID>/fd/
 ```
 
-Se tcpdump vazio: frequência errada, sinal fraco, ou TETRA_HACK_RXID não definido.
+Se tcpdump vazio: frequência errada, sinal fraco, ou demodulador falhando.
 
 ---
 
 ## Lições Aprendidas
 
-### 1. `TETRA_HACK_RXID` é obrigatório
-`atoi(getenv("TETRA_HACK_RXID"))` → SIGSEGV se RXID não estiver definido.
-Sempre definir as três variáveis TETRA_HACK_* juntas.
+### 1. GNURadio É necessário
+O demodulador numpy simplificado (decimação + fase diferencial) é insuficiente
+para sinal TETRA real. A cadeia GNURadio completa (AGC → FLL → Clock Recovery
+→ Equalizer → DQPSK) é necessária para sincronização robusta.
 
-### 2. `tetra-rx -i` aceita floats de fase, NÃO IQ complexo
-**Erro anterior**: assumiu-se que `-i` fazia demodulação IQ completa internamente.
-**Verdade**: `-i` faz apenas `float_to_bits` (quantiza floats → símbolos).
-A demodulação pi/4-DQPSK (IQ → phase floats) ainda é necessária externamente.
-**Solução**: `_dqpsk_demod_thread` em `tetra_decoder.py` usa numpy para:
-  1. Ler IQ complex64 do stdin
-  2. Decimar por 2 (36kS/s → 18kS/s)
-  3. Fase diferencial: `angle(z[k]*conj(z[k-1])) / (pi/4)`
-  4. Escrever float32 no stdin do tetra-rx via PIPE
+### 2. `TETRA_HACK_RXID` é obrigatório
+`atoi(getenv("TETRA_HACK_RXID"))` → SIGSEGV se RXID não estiver definido.
 
 ### 3. `PopenModule` não captura stderr por padrão
-`PopenModule._getProcess()` usa apenas `stdin=PIPE, stdout=PIPE`.
-Sem `stderr=PIPE`, `self.process.stderr` é None e a thread de metadados
-nunca inicia — silenciosamente, causando painel frontend sempre vazio.
-**Solução**: override de `_getProcess()` em `TetraDecoderModule`.
+Override de `_getProcess()` em `TetraDecoderModule` é necessário.
 
-### 4. GNURadio não é necessário
-O projeto original (trollminer) usa GNURadio para a demodulação DQPSK.
-Não é necessário — numpy é suficiente e está disponível no Debian.
+### 4. A porta UDP é dinâmica
+O `tetra_decoder.py` usa `find_free_port()` para evitar conflitos quando
+múltiplas instâncias rodam em paralelo (múltiplos SDRs).
 
-### 5. Com TETMON ativo, stdout do tetra-rx fica vazio
-Tudo vai via UDP. Usar `stdout=DEVNULL`; áudio vem de UDP com `TRA:`.
+### 5. `tetra-rx -i` vs sem `-i`
+- **Com GNURadio**: NÃO usar `-i`. GNURadio produz bits (bytes), tetra-rx lê direto.
+- **Com numpy (descontinuado)**: usava `-i` para floats de fase.
 
-### 6. sdecoder/cdecoder exigem argumentos de arquivo
-Chamados sem args → zombie imediato. Usar `/dev/stdin /dev/stdout`.
-
-### 7. `Tetra.setMetaWriter()` deve ser forwarded
-Sem forward para `TetraDecoderModule.setMetaWriter()`, `_meta_writer`
-fica None e todos os metadados são descartados silenciosamente.
+### 6. `stdin=0` herda o fd do parent
+`tetra_demod.py` usa `stdin=0` (file descriptor 0 do parent). Como
+`tetra_decoder.py` nunca lê do seu stdin, o demod herda a PIPE do
+PopenModule e recebe IQ diretamente.
 
 ---
 

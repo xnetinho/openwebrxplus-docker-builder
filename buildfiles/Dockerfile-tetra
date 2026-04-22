@@ -12,10 +12,10 @@ RUN --mount=type=cache,id=owrxp-tetra-buildcache,target=/build_cache \
 # Stage 2: runtime — extends the softmbe image already on Docker Hub
 FROM slechev/openwebrxplus-softmbe:latest
 
-# numpy: required for the RRC-filtered pi/4-DQPSK demodulator.
-# python3-numpy is in Debian main — always available.
+# gnuradio: required for the pi/4-DQPSK demodulator (tetra_demod.py).
+# Provides AGC, FLL, Clock Recovery, Equalizer, Constellation Decoder.
 RUN apt-get update -qq \
-    && apt-get install -y --no-install-recommends python3-numpy \
+    && apt-get install -y --no-install-recommends gnuradio python3-numpy \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Compiled binaries from stage 1
@@ -26,6 +26,7 @@ COPY files/patch_tetra.py       /tmp/tetra_files/patch_tetra.py
 COPY files/csdr_chain_tetra.py  /tmp/tetra_files/csdr_chain_tetra.py
 COPY files/csdr_module_tetra.py /tmp/tetra_files/csdr_module_tetra.py
 COPY files/tetra_decoder.py     /tmp/tetra_files/tetra_decoder.py
+COPY files/tetra_demod.py       /tmp/tetra_files/tetra_demod.py
 
 COPY common.sh /
 COPY install-tetra-packages.sh /
