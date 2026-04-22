@@ -1,6 +1,7 @@
 import json
 import logging
 import pickle
+import subprocess
 import threading
 from csdr.module import PopenModule
 from pycsdr.types import Format
@@ -32,15 +33,24 @@ class TetraDecoderModule(PopenModule):
     def getCommand(self):
         return ["python3", TETRA_DECODER_SCRIPT]
 
+    def _getProcess(self):
+        # Override to capture stderr so the metadata thread can read it.
+        # PopenModule default only sets stdin=PIPE, stdout=PIPE.
+        return subprocess.Popen(
+            self.getCommand(),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
     def start(self):
         super().start()
-        if self.process and self.process.stderr:
-            self._meta_thread = threading.Thread(
-                target=self._read_meta,
-                daemon=True,
-                name="tetra-meta-reader",
-            )
-            self._meta_thread.start()
+        self._meta_thread = threading.Thread(
+            target=self._read_meta,
+            daemon=True,
+            name="tetra-meta-reader",
+        )
+        self._meta_thread.start()
 
     def setMetaWriter(self, writer):
         self._meta_writer = writer
@@ -53,8 +63,8 @@ class TetraDecoderModule(PopenModule):
                     continue
                 try:
                     msg = json.loads(line)
-                    msg["protocol"] = "TETRA"  # MetaPanel.isSupported checks data.protocol
-                    msg["mode"] = "tetra"       # kept for compatibility
+                    msg["protocol"] = "TETRA"
+                    msg["mode"] = "tetra"
                     if self._meta_writer:
                         self._meta_writer.write(pickle.dumps(msg))
                 except json.JSONDecodeError:
