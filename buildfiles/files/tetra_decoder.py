@@ -165,6 +165,7 @@ def parse_metadata_from_udp(data):
         except ValueError:
             color_code = int(ccode_raw) if ccode_raw.isdigit() else 0
         crypt = int(fields.get('CRYPT', '0'))
+        tea_names = {0: "none", 1: "TEA1", 2: "TEA2", 3: "TEA3"}
         return {
             "protocol": "TETRA",
             "type": "netinfo",
@@ -174,6 +175,7 @@ def parse_metadata_from_udp(data):
             "ul_freq": int(fields.get('ULF', '0')),
             "color_code": color_code,
             "encrypted": crypt > 0,
+            "encryption_type": tea_names.get(crypt, f"unknown({crypt})"),
             "la": fields.get('LA', ''),
         }
 
