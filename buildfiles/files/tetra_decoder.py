@@ -6,13 +6,16 @@ stdout: 16-bit signed LE PCM at 8 kHz mono
 stderr: JSON metadata lines (one object per line)
 
 Pipeline:
-  stdin IQ → tetra-rx -i (built-in float_to_bits demod + pseudo-AFC)
-                 └→ TETMON UDP:7379 → JSON metadata → stderr
-                 └→ TETMON UDP:7379 → TRA: audio → sdecoder → stdout PCM
+  stdin IQ
+    → _dqpsk_demod_thread (numpy: differential pi/4-DQPSK, decimate 2x)
+    → tetra-rx -i (built-in float_to_bits + pseudo-AFC)
+        └→ TETMON UDP:7379 → JSON metadata → stderr
+        └→ TETMON UDP:7379 → TRA: audio → sdecoder → stdout PCM
 """
 
 import json
 import logging
+import numpy as np
 import os
 import queue
 import re
@@ -36,7 +39,10 @@ PCM_BYTES   = 960
 SILENCE     = b"\x00" * PCM_BYTES
 TETMON_PORT = 7379
 
-# Per-type rate limits — minimum seconds between successive emissions
+# 36 kS/s input, 18 kBaud TETRA = 2 samples per symbol
+_SAMP_PER_SYM = 2
+
+# Per-type rate limits
 _RATE_LIMITS = {
     "netinfo":  5.0,
     "freqinfo": 10.0,
@@ -68,7 +74,7 @@ def _emit(obj: dict) -> None:
         pass
 
 
-# ── TETMON field helpers ──────────────────────────────────────────────────────
+# ── TETMON field helpers ───────────────────────────────────────────────
 
 def _field(payload: str, key: str, default=None):
     m = re.search(rf'(?<!\w){re.escape(key)}:(\S+)', payload, re.IGNORECASE)
@@ -76,7 +82,6 @@ def _field(payload: str, key: str, default=None):
 
 
 def _to_dec(s, default="") -> str:
-    """Convert a TETMON hex field to decimal string; leave decimal strings alone."""
     if not s:
         return default
     try:
@@ -101,13 +106,11 @@ def _enc_mode_str(val) -> str:
     return modes.get(str(val) if val is not None else "0", str(val) if val else "None")
 
 
-# ── TETMON parser ─────────────────────────────────────────────────────────────
+# ── TETMON parser ────────────────────────────────────────────────────
 
 def _parse_tetmon(data: bytes) -> None:
-    """Parse a TETMON UDP datagram and emit typed JSON to stderr."""
     try:
         text = data.decode("utf-8", errors="replace")
-
         begin = text.find("TETMON_begin")
         if begin >= 0:
             end = text.find("TETMON_end", begin)
@@ -140,82 +143,63 @@ def _parse_tetmon(data: bytes) -> None:
                 mnc = str(int(mnc, 16)) if not mnc.isdigit() else mnc
             except Exception:
                 pass
-            _emit({
-                "type": "netinfo",
-                "mcc": mcc,
-                "mnc": mnc,
-                "dl_freq": _field(p, "DL") or _field(p, "DLF", ""),
-                "ul_freq": _field(p, "UL") or _field(p, "ULF", ""),
-                "color_code": _field(p, "CC", ""),
-                "la": _field(p, "LA", ""),
-                "encrypted": (_field(p, "CRYPT", "0") != "0"),
-            })
+            _emit({"type": "netinfo", "mcc": mcc, "mnc": mnc,
+                   "dl_freq": _field(p, "DL") or _field(p, "DLF", ""),
+                   "ul_freq": _field(p, "UL") or _field(p, "ULF", ""),
+                   "color_code": _field(p, "CC", ""),
+                   "la": _field(p, "LA", ""),
+                   "encrypted": (_field(p, "CRYPT", "0") != "0")})
 
         elif func == "FREQINFO1":
             if not _rate_ok("freqinfo"):
                 return
-            _emit({
-                "type": "freqinfo",
-                "dl_freq": _field(p, "DL") or _field(p, "DLF", ""),
-                "ul_freq": _field(p, "UL") or _field(p, "ULF", ""),
-            })
+            _emit({"type": "freqinfo",
+                   "dl_freq": _field(p, "DL") or _field(p, "DLF", ""),
+                   "ul_freq": _field(p, "UL") or _field(p, "ULF", "")})
 
         elif func == "ENCINFO1":
             if not _rate_ok("encinfo"):
                 return
-            _emit({
-                "type": "encinfo",
-                "encrypted": (_field(p, "CRYPT", "0") != "0"),
-                "enc_mode": _enc_mode_str(_field(p, "ENCMODE", "0")),
-            })
+            _emit({"type": "encinfo",
+                   "encrypted": (_field(p, "CRYPT", "0") != "0"),
+                   "enc_mode": _enc_mode_str(_field(p, "ENCMODE", "0"))})
 
         elif func in ("DSETUPDEC", "D-SETUP"):
             if not _rate_ok("call"):
                 return
-            _emit({
-                "type": "call_setup",
-                "issi": _to_dec(_field(p, "SSI", "")),
-                "gssi": _to_dec(_field(p, "SSI2") or _field(p, "GSSI", "")),
-                "call_id": _field(p, "CALLID") or _field(p, "CID", ""),
-                "call_type": "group",
-                "slot": _slot(p),
-                "encrypted": (_field(p, "CRYPT", "0") != "0"),
-            })
+            _emit({"type": "call_setup",
+                   "issi": _to_dec(_field(p, "SSI", "")),
+                   "gssi": _to_dec(_field(p, "SSI2") or _field(p, "GSSI", "")),
+                   "call_id": _field(p, "CALLID") or _field(p, "CID", ""),
+                   "call_type": "group", "slot": _slot(p),
+                   "encrypted": (_field(p, "CRYPT", "0") != "0")})
 
         elif func in ("DCONNECTDEC", "D-CONNECT", "D-CONNECT ACK"):
             if not _rate_ok("call"):
                 return
-            _emit({
-                "type": "connect",
-                "issi": _to_dec(_field(p, "SSI", "")),
-                "gssi": _to_dec(_field(p, "SSI2") or _field(p, "GSSI", "")),
-                "call_id": _field(p, "CALLID") or _field(p, "CID", ""),
-                "call_type": "group",
-                "slot": _slot(p),
-                "encrypted": (_field(p, "CRYPT", "0") != "0"),
-            })
+            _emit({"type": "connect",
+                   "issi": _to_dec(_field(p, "SSI", "")),
+                   "gssi": _to_dec(_field(p, "SSI2") or _field(p, "GSSI", "")),
+                   "call_id": _field(p, "CALLID") or _field(p, "CID", ""),
+                   "call_type": "group", "slot": _slot(p),
+                   "encrypted": (_field(p, "CRYPT", "0") != "0")})
 
         elif func in ("DTXGRANTDEC", "D-TX-GRANTED", "D-TX GRANTED"):
             if not _rate_ok("call"):
                 return
-            _emit({
-                "type": "tx_grant",
-                "issi": _to_dec(_field(p, "SSI", "")),
-                "gssi": _to_dec(_field(p, "SSI2") or _field(p, "GSSI", "")),
-                "call_id": _field(p, "CALLID") or _field(p, "CID", ""),
-                "call_type": "group",
-                "slot": _slot(p),
-                "encrypted": (_field(p, "CRYPT", "0") != "0"),
-            })
+            _emit({"type": "tx_grant",
+                   "issi": _to_dec(_field(p, "SSI", "")),
+                   "gssi": _to_dec(_field(p, "SSI2") or _field(p, "GSSI", "")),
+                   "call_id": _field(p, "CALLID") or _field(p, "CID", ""),
+                   "call_type": "group", "slot": _slot(p),
+                   "encrypted": (_field(p, "CRYPT", "0") != "0")})
 
         elif func in ("DRELEASEDEC", "D-RELEASE"):
             if not _rate_ok("release"):
                 return
-            _emit({
-                "type": "call_release",
-                "issi": _to_dec(_field(p, "SSI", "")),
-                "call_id": _field(p, "CALLID") or _field(p, "CID", ""),
-            })
+            _emit({"type": "call_release",
+                   "issi": _to_dec(_field(p, "SSI", "")),
+                   "call_id": _field(p, "CALLID") or _field(p, "CID", "")})
 
         elif func == "DSTATUSDEC":
             if not _rate_ok("status"):
@@ -225,39 +209,32 @@ def _parse_tetmon(data: bytes) -> None:
                 status = str(int(status_raw, 16))
             except Exception:
                 status = status_raw
-            _emit({
-                "type": "status",
-                "issi": _to_dec(_field(p, "SSI", "")),
-                "to": _to_dec(_field(p, "SSI2", "")),
-                "status": status,
-            })
+            _emit({"type": "status",
+                   "issi": _to_dec(_field(p, "SSI", "")),
+                   "to": _to_dec(_field(p, "SSI2", "")),
+                   "status": status})
 
         elif func == "SDSDEC":
             if not _rate_ok("sds"):
                 return
             msg_m = re.search(r'MSG:(.+?)(?:TETMON_end|FUNC:|$)', p, re.DOTALL)
-            _emit({
-                "type": "sds",
-                "from": _to_dec(_field(p, "SSI", "")),
-                "to": _to_dec(_field(p, "SSI2", "")),
-                "text": msg_m.group(1).strip() if msg_m else "",
-            })
+            _emit({"type": "sds",
+                   "from": _to_dec(_field(p, "SSI", "")),
+                   "to": _to_dec(_field(p, "SSI2", "")),
+                   "text": msg_m.group(1).strip() if msg_m else ""})
 
         elif func == "BURST":
             if not _rate_ok("burst"):
                 return
-            _emit({
-                "type": "burst",
-                "slot": _slot(p),
-                "afc": _field(p, "AFC", "0"),
-                "burst_rate": _field(p, "RATE", ""),
-            })
+            _emit({"type": "burst", "slot": _slot(p),
+                   "afc": _field(p, "AFC", "0"),
+                   "burst_rate": _field(p, "RATE", "")})
 
     except Exception as e:
         logger.debug("TETMON parse error: %s", e)
 
 
-# ── TETMON UDP listener ───────────────────────────────────────────────────────
+# ── TETMON UDP listener ───────────────────────────────────────────────
 
 def _tetmon_listener(
     stop_event: threading.Event,
@@ -275,7 +252,6 @@ def _tetmon_listener(
     while not stop_event.is_set():
         try:
             data, _ = sock.recvfrom(4096)
-            # Audio frame: TRA: marker followed by raw ACELP data
             tra_pos = data.find(b"TRA:")
             if tra_pos >= 0:
                 frame = data[tra_pos + 4 : tra_pos + 4 + FRAME_BYTES]
@@ -294,13 +270,70 @@ def _tetmon_listener(
     sock.close()
 
 
-# ── Audio pipeline ────────────────────────────────────────────────────────────
+# ── pi/4-DQPSK demodulator ───────────────────────────────────────────────
+
+def _dqpsk_demod_thread(
+    tetra_rx_proc: subprocess.Popen,
+    stop_event: threading.Event,
+) -> None:
+    """
+    Reads complex float32 IQ at 36 kS/s from stdin.
+    Demodulates pi/4-DQPSK via differential phase detection (decimate 2x).
+    Writes float32 phase symbols at 18 kS/s to tetra-rx stdin.
+
+    tetra-rx -i accepts pre-demodulated real-float phase-shift symbols,
+    NOT raw complex IQ.  The -i flag only performs float_to_bits internally.
+    """
+    # 16 bytes = 2 complex64 samples = 1 symbol period
+    ALIGN = _SAMP_PER_SYM * 8
+    prev_sym = np.complex64(1.0 + 0j)
+    leftover = b""
+
+    while not stop_event.is_set():
+        try:
+            chunk = sys.stdin.buffer.read(4096)
+        except Exception:
+            break
+        if not chunk:
+            break
+
+        buf = leftover + chunk
+        # Round down to complete symbol periods (2 IQ samples = 16 bytes each)
+        n_bytes = (len(buf) // ALIGN) * ALIGN
+        if n_bytes == 0:
+            leftover = buf
+            continue
+        leftover = buf[n_bytes:]
+
+        iq = np.frombuffer(buf[:n_bytes], dtype=np.complex64)
+
+        # Decimate by 2: one sample per symbol (symbol timing)
+        z = iq[::_SAMP_PER_SYM]
+
+        # Differential phase detection
+        z_prev = np.empty(len(z) + 1, dtype=np.complex64)
+        z_prev[0] = prev_sym
+        z_prev[1:] = z[:-1]
+        diff = z * np.conj(z_prev)
+        # Normalise to units of pi/4 — tetra-rx process_sym_fl() quantises
+        # these into the 4 DQPSK symbols {-3, -1, +1, +3}
+        phase = (np.angle(diff) / (np.pi / 4)).astype(np.float32)
+
+        prev_sym = z[-1]
+
+        try:
+            tetra_rx_proc.stdin.write(phase.tobytes())
+            tetra_rx_proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            break
+
+
+# ── Audio pipeline ─────────────────────────────────────────────────────────
 
 class _AudioPipeline:
     """
-    TETMON audio path: TRA: frames (already channel-decoded by tetra-rx) go
-    directly to sdecoder.  sdecoder requires filename args — use
-    /dev/stdin /dev/stdout so it reads/writes through the subprocess pipes.
+    TETMON audio: TRA: frames (already channel-decoded by tetra-rx) go
+    directly to sdecoder via /dev/stdin /dev/stdout.
     """
 
     def __init__(self):
@@ -319,7 +352,6 @@ class _AudioPipeline:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
             )
-            logger.debug("Audio: %s /dev/stdin /dev/stdout", dec)
         except Exception as e:
             logger.warning("Decoder start failed: %s", e)
 
@@ -359,7 +391,7 @@ class _AudioPipeline:
                 self._decoder = None
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+# ── Main ────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     stop_event = threading.Event()
@@ -375,14 +407,11 @@ def main() -> None:
     tetra_env["TETRA_HACK_IP"]   = "127.0.0.1"
     tetra_env["TETRA_HACK_RXID"] = "1"
 
-    # tetra-rx with -i reads float32 IQ directly and demodulates internally.
-    # -a: pseudo-AFC corrects small frequency offsets automatically.
-    # -e: emit metadata for encrypted calls (no audio decryption).
-    # -r -s: reassemble fragmented PDUs, display SDS as text.
-    # stdin=0: inherit parent fd 0 (the IQ pipe from OpenWebRX+).
+    # tetra-rx -i expects pre-demodulated float32 phase symbols (NOT raw IQ).
+    # _dqpsk_demod_thread reads IQ from fd 0, demodulates, and writes here.
     tetra_rx = subprocess.Popen(
         [TETRA_RX, "-i", "-a", "-r", "-s", "-e", "/dev/stdin"],
-        stdin=0,
+        stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         env=tetra_env,
@@ -392,6 +421,12 @@ def main() -> None:
         for line in tetra_rx.stderr:
             logger.debug("tetra-rx: %s", line.decode("utf-8", errors="replace").rstrip())
     threading.Thread(target=_log_tetra_stderr, daemon=True, name="tetra-rx-log").start()
+
+    # Demodulation thread: reads complex IQ from stdin, writes float symbols
+    threading.Thread(
+        target=_dqpsk_demod_thread, args=(tetra_rx, stop_event),
+        daemon=True, name="dqpsk-demod",
+    ).start()
 
     audio = _AudioPipeline()
     audio.start()
