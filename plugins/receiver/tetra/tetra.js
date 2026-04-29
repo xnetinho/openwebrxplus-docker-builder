@@ -1,8 +1,9 @@
 /*
- * tetra Receiver Plugin for OpenWebRX+
+ * tetra Receiver Plugin for OpenWebRX+ — v1.2
  *
  * Displays TETRA (Terrestrial Trunked Radio) signaling metadata:
- * network info, encryption mode, 4 TDMA timeslots, status and SDS messages.
+ * network info, encryption mode (TEA1/2/3), 4 TDMA timeslots,
+ * status and SDS messages.
  *
  * Requires the xnetinho/openwebrxplus-tetra Docker image (backend decoder).
  *
@@ -13,21 +14,19 @@
  * Copyright (c) 2026 xnetinho
  *
  * Changes:
+ * 1.2:
+ *  - receives encryption_type from backend (TEA1/TEA2/TEA3/none)
+ *  - STATUS and SDS moved into SIGNAL column
+ *  - fixed-width columns to prevent layout dancing
+ *  - improved _setEnc to use encryption_type field
  * 1.1:
- *  - robust TETMON parser: NETINFO1, FREQINFO1, ENCINFO1, DSETUPDEC,
- *    DCONNECTDEC, DTXGRANTDEC, DRELEASEDEC, DSTATUSDEC, SDSDEC, BURST
- *  - granular per-type rate limiting in backend
- *  - two-stage codec (cdecoder | sdecoder) in backend
- *  - GNURadio pi/4-DQPSK demodulation stage connected to tetra-rx
- *  - new panel fields: Location Area (LA), encryption mode (TEA1/2/3),
- *    network name map, status messages, SDS messages
- *  - panel layout expanded proportionally to data; no overflow
+ *  - robust TETMON parser, GNURadio demod, codec pipeline
  * 1.0:
  *  - initial release
  */
 
 Plugins.tetra = Plugins.tetra || {};
-Plugins.tetra._version = 1.1;
+Plugins.tetra._version = 1.2;
 
 /*
  * Optional network name map: add entries as 'MCC-MNC': 'Name'.
@@ -89,7 +88,8 @@ Plugins.tetra._injectPanel = function () {
 			'style="display:none" ' +
 			'data-panel-name="metadata-tetra">' +
 
-			'<div class="tetra-section">' +
+			/* ── Coluna 1: NETWORK ─────────────────────────────── */
+			'<div class="tetra-section tetra-col-network">' +
 				'<div class="tetra-section-title">Network</div>' +
 				'<div class="tetra-grid">' +
 					'<span class="tetra-key">Name</span>' +
@@ -109,29 +109,36 @@ Plugins.tetra._injectPanel = function () {
 				'</div>' +
 			'</div>' +
 
-			'<div class="tetra-section">' +
+			/* ── Coluna 2: SIGNAL + STATUS + SDS ───────────────── */
+			'<div class="tetra-section tetra-col-signal">' +
 				'<div class="tetra-section-title">Signal</div>' +
-				'<div class="tetra-grid">' +
+				'<div class="tetra-signal-grid">' +
 					'<span class="tetra-key">AFC</span>' +
 					'<span class="tetra-val" id="tetra-afc">---</span>' +
 					'<span class="tetra-key">Bursts/s</span>' +
 					'<span class="tetra-val" id="tetra-burst-rate">---</span>' +
 				'</div>' +
+
+				/* STATUS dentro de SIGNAL */
+				'<div id="tetra-status-block" style="display:none">' +
+					'<div class="tetra-signal-separator"></div>' +
+					'<div class="tetra-signal-subtitle">Status</div>' +
+					'<div class="tetra-status-line" id="tetra-last-status">---</div>' +
+				'</div>' +
+
+				/* SDS dentro de SIGNAL */
+				'<div id="tetra-sds-block" style="display:none">' +
+					'<div class="tetra-signal-separator"></div>' +
+					'<div class="tetra-signal-subtitle">SDS</div>' +
+					'<div class="tetra-sds-line" id="tetra-last-sds">---</div>' +
+				'</div>' +
+
 			'</div>' +
 
-			'<div class="tetra-section">' +
+			/* ── Coluna 3: TIMESLOTS ───────────────────────────── */
+			'<div class="tetra-section tetra-col-timeslots">' +
 				'<div class="tetra-section-title">Timeslots</div>' +
 				slots +
-			'</div>' +
-
-			'<div class="tetra-section tetra-messages" id="tetra-status-section" style="display:none">' +
-				'<div class="tetra-section-title">Status</div>' +
-				'<div class="tetra-message-row" id="tetra-last-status">---</div>' +
-			'</div>' +
-
-			'<div class="tetra-section tetra-messages" id="tetra-sds-section" style="display:none">' +
-				'<div class="tetra-section-title">SDS</div>' +
-				'<div class="tetra-message-row" id="tetra-last-sds">---</div>' +
 			'</div>' +
 
 		'</div>';
@@ -222,7 +229,7 @@ Plugins.tetra._registerMetaPanel = function () {
 			$('#tetra-dl').text(Plugins.tetra._formatFreq(data.dl_freq));
 			$('#tetra-ul').text(Plugins.tetra._formatFreq(data.ul_freq));
 			$('#tetra-cc').text(data.color_code !== undefined && data.color_code !== '' ? data.color_code : '---');
-			Plugins.tetra._setEnc(data.encrypted, null);
+			Plugins.tetra._setEnc(data.encrypted, data.encryption_type);
 
 		} else if (type === 'freqinfo') {
 			$('#tetra-dl').text(Plugins.tetra._formatFreq(data.dl_freq));
@@ -239,7 +246,7 @@ Plugins.tetra._registerMetaPanel = function () {
 				this.slots[si].el.addClass('active');
 			}
 
-		} else if (type === 'call_setup' || type === 'connect' || type === 'tx_grant') {
+		} else if (type === 'call_setup' || type === 'call_connect' || type === 'tx_grant') {
 			var si2 = (data.slot || 0);
 			if (si2 >= 0 && si2 < this.slots.length) {
 				this.slots[si2].update(data);
@@ -251,14 +258,18 @@ Plugins.tetra._registerMetaPanel = function () {
 			}
 
 		} else if (type === 'status') {
-			var stxt = (data.issi || '?') + ' \u2192 ' + (data.to || '?') + ': Status ' + (data.status || '?');
+			var ssiFrom = data.ssi || '?';
+			var ssiTo   = data.ssi2 || '?';
+			var stxt = ssiFrom + ' \u2192 ' + ssiTo + '  Status ' + (data.status || '?');
 			$('#tetra-last-status').text(stxt);
-			$('#tetra-status-section').show();
+			$('#tetra-status-block').show();
 
 		} else if (type === 'sds') {
-			var sdstxt = (data.from || '?') + ' \u2192 ' + (data.to || '?') + ': ' + (data.text || '');
+			var from = data.ssi || data.from || '?';
+			var to   = data.ssi2 || data.to || '?';
+			var sdstxt = from + ' \u2192 ' + to + ': ' + (data.text || '');
 			$('#tetra-last-sds').text(sdstxt);
-			$('#tetra-sds-section').show();
+			$('#tetra-sds-block').show();
 		}
 	};
 
@@ -273,8 +284,10 @@ Plugins.tetra._registerMetaPanel = function () {
 		$('#tetra-enc').text('---').removeClass('enc-yes enc-no enc-tea');
 		$('#tetra-afc').text('---');
 		$('#tetra-burst-rate').text('---');
-		$('#tetra-status-section').hide();
-		$('#tetra-sds-section').hide();
+		$('#tetra-last-status').text('---');
+		$('#tetra-status-block').hide();
+		$('#tetra-last-sds').text('---');
+		$('#tetra-sds-block').hide();
 		for (var i = 0; i < this.slots.length; i++) {
 			this.slots[i].clear();
 		}
@@ -299,13 +312,34 @@ Plugins.tetra._formatFreq = function (hz) {
 	return (n / 1e6).toFixed(4) + ' MHz';
 };
 
-Plugins.tetra._setEnc = function (encrypted, encMode) {
+/**
+ * Atualiza o badge de criptografia.
+ *
+ * @param {boolean} encrypted  - se a rede usa criptografia
+ * @param {string}  encType    - valor do campo encryption_type do backend:
+ *                               "TEA1", "TEA2", "TEA3", "none",
+ *                               ou enc_mode hex do ENCINFO1 (ex: "05")
+ */
+Plugins.tetra._setEnc = function (encrypted, encType) {
 	var $el = $('#tetra-enc');
 	$el.removeClass('enc-yes enc-no enc-tea');
-	if (encrypted) {
-		var label = (encMode && encMode !== 'None') ? encMode : 'YES';
-		$el.text(label).addClass(encMode && encMode !== 'None' ? 'enc-tea' : 'enc-yes');
-	} else {
+
+	if (!encrypted) {
 		$el.text('No').addClass('enc-no');
+		return;
+	}
+
+	/* Se o backend envia encryption_type como "TEA1", "TEA2", "TEA3" */
+	if (encType && encType !== 'none' && encType !== 'None' && encType !== '00') {
+		/* Normaliza: garante formato "TEAn" */
+		var label = encType.toUpperCase();
+		if (label.indexOf('TEA') === 0) {
+			$el.text(label).addClass('enc-tea');
+		} else {
+			/* enc_mode hex do ENCINFO1 (ex: "05") — mostra raw */
+			$el.text('ENC 0x' + label).addClass('enc-tea');
+		}
+	} else {
+		$el.text('YES').addClass('enc-yes');
 	}
 };
