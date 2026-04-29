@@ -1,12 +1,4 @@
-/* tetra plugin — panel layout v1.2
- *
- * Layout: 4 colunas horizontais com largura fixa (não "dançam").
- * Seções: NETWORK | SIGNAL | TIMESLOTS (no scroll/resize)
- *
- * STATUS e SDS agora ficam dentro de SIGNAL.
- */
-
-/* ── Panel container ─────────────────────────────────────────────────────── */
+/* tetra plugin — panel layout v1.3 */
 
 .tetra-panel {
 	display: flex;
@@ -17,19 +9,15 @@
 	min-width: 580px;
 	width: max-content;
 	max-width: 720px;
+	align-items: stretch;
 }
-
-/* ── Sections — colunas lado a lado ──────────────────────────────────────── */
 
 .tetra-section {
 	flex-shrink: 0;
 	padding: 6px 0 4px;
 	border-right: 1px solid rgba(255,255,255,0.07);
 }
-
-.tetra-section:last-child {
-	border-right: none;
-}
+.tetra-section:last-child { border-right: none; }
 
 .tetra-section-title {
 	font-size: 0.72em;
@@ -39,32 +27,13 @@
 	padding: 0 10px 4px;
 }
 
-/* ── Coluna NETWORK — largura fixa ───────────────────────────────────────── */
-
-.tetra-col-network {
-	width: 200px;
-	min-width: 200px;
-}
-
-/* ── Coluna SIGNAL — largura fixa ────────────────────────────────────────── */
-
-.tetra-col-signal {
-	width: 180px;
-	min-width: 180px;
-}
-
-/* ── Coluna TIMESLOTS — ocupa o restante ─────────────────────────────────── */
-
-.tetra-col-timeslots {
-	flex: 1;
-	min-width: 240px;
-}
-
-/* ── Key/value grid com colunas fixas ────────────────────────────────────── */
+.tetra-col-network   { flex: 0 0 200px; overflow: hidden; }
+.tetra-col-signal    { flex: 0 0 180px; overflow: hidden; }
+.tetra-col-timeslots { flex: 1 0 240px; overflow: hidden; }
 
 .tetra-grid {
 	display: grid;
-	grid-template-columns: 90px 1fr;
+	grid-template-columns: 90px minmax(0, 1fr);
 	column-gap: 8px;
 	row-gap: 3px;
 	padding: 0 10px;
@@ -87,34 +56,21 @@
 	align-self: center;
 	min-width: 0;
 }
+.tetra-val.tetra-wide { white-space: normal; word-break: break-word; }
 
-.tetra-val.tetra-wide {
-	white-space: normal;
-	word-break: break-word;
-}
-
-/* ── Encryption badge ────────────────────────────────────────────────────── */
-
-.tetra-enc {
-	font-weight: 600;
-	align-self: center;
-}
-
-.tetra-enc.enc-yes  { color: #e05555; }
+.tetra-enc { font-weight: 600; align-self: center; }
+.tetra-enc.enc-tea  { color: #e05555; }
 .tetra-enc.enc-no   { color: #5cb85c; }
-.tetra-enc.enc-tea  { color: #e8a020; }
-
-/* ── Signal grid com colunas fixas ───────────────────────────────────────── */
+.tetra-enc.enc-yes  { color: #e05555; }
+.tetra-enc.enc-cell { color: #c8960a; }
 
 .tetra-signal-grid {
 	display: grid;
-	grid-template-columns: 70px 1fr;
+	grid-template-columns: 70px minmax(0, 1fr);
 	column-gap: 8px;
 	row-gap: 3px;
 	padding: 0 10px;
 }
-
-/* ── Separator dentro de SIGNAL ──────────────────────────────────────────── */
 
 .tetra-signal-separator {
 	border-top: 1px solid rgba(255,255,255,0.07);
@@ -129,27 +85,16 @@
 	padding: 0 10px 3px;
 }
 
-/* ── Status / SDS dentro de SIGNAL ───────────────────────────────────────── */
-
 .tetra-status-line,
 .tetra-sds-line {
 	padding: 2px 10px;
-	color: #ccc;
 	font-size: 0.80em;
 	word-break: break-word;
 	white-space: normal;
 	line-height: 1.35;
 }
-
-.tetra-status-line {
-	color: #d4a857;
-}
-
-.tetra-sds-line {
-	color: #7cb3e0;
-}
-
-/* ── Timeslots ───────────────────────────────────────────────────────────── */
+.tetra-status-line { color: #d4a857; }
+.tetra-sds-line    { color: #7cb3e0; }
 
 .openwebrx-tetra-slot {
 	display: flex;
@@ -160,28 +105,21 @@
 	opacity: 0.38;
 	transition: opacity 0.2s, background-color 0.2s, border-left-color 0.2s;
 }
-
 .openwebrx-tetra-slot + .openwebrx-tetra-slot {
 	border-top: 1px solid rgba(255,255,255,0.05);
 }
-
 .openwebrx-tetra-slot.active {
 	opacity: 1;
 	background-color: rgba(255,255,255,0.05);
 }
-
 .openwebrx-tetra-slot.groupcall  { border-left-color: #4a9eff; }
 .openwebrx-tetra-slot.directcall { border-left-color: #f0a030; }
 .openwebrx-tetra-slot.emergency  { border-left-color: #e05555; }
-
-/* Lock indicator for encrypted slots */
 .openwebrx-tetra-slot.encrypted .tetra-slot-number::after {
 	content: ' \1F512';
 	font-size: 0.72em;
 	vertical-align: middle;
 }
-
-/* ── Slot left column (number + icon) ────────────────────────────────────── */
 
 .tetra-slot-left {
 	display: flex;
@@ -192,35 +130,18 @@
 	flex-shrink: 0;
 	min-width: 36px;
 }
-
-.tetra-slot-number {
-	color: rgba(255,255,255,0.4);
-	font-size: 0.76em;
-	white-space: nowrap;
-}
+.tetra-slot-number { color: rgba(255,255,255,0.4); font-size: 0.76em; white-space: nowrap; }
 
 .openwebrx-tetra-slot .openwebrx-meta-user-image {
-	width: 22px;
-	height: 22px;
-	position: relative;
-	flex-shrink: 0;
+	width: 22px; height: 22px; position: relative; flex-shrink: 0;
 }
-
 .openwebrx-tetra-slot .openwebrx-meta-user-image img {
-	position: absolute;
-	inset: 0;
-	width: 100%;
-	height: 100%;
-	object-fit: contain;
-	opacity: 0;
-	transition: opacity 0.15s;
+	position: absolute; inset: 0; width: 100%; height: 100%;
+	object-fit: contain; opacity: 0; transition: opacity 0.15s;
 }
-
 .openwebrx-tetra-slot.groupcall  .openwebrx-meta-user-image img.groupcall  { opacity: 1; }
 .openwebrx-tetra-slot.directcall .openwebrx-meta-user-image img.directcall { opacity: 1; }
 .openwebrx-tetra-slot.emergency  .openwebrx-meta-user-image img.directcall { opacity: 1; }
-
-/* ── Slot body (key/value rows) — grid fixo ──────────────────────────────── */
 
 .tetra-slot-body {
 	display: grid;
@@ -231,34 +152,8 @@
 	min-width: 0;
 	align-content: center;
 }
-
-.tetra-slot-key {
-	color: rgba(255,255,255,0.35);
-	font-size: 0.78em;
-	white-space: nowrap;
-	align-self: center;
-}
-
-.tetra-slot-val {
-	color: #ddd;
-	white-space: nowrap;
-	overflow: hidden;
-	text-overflow: ellipsis;
-	align-self: center;
-}
-
-.tetra-issi {
-	font-weight: 600;
-	color: #eee;
-}
-
-.tetra-gssi {
-	color: rgba(255,255,255,0.65);
-}
-
-.tetra-calltype {
-	font-size: 0.78em;
-	color: rgba(255,255,255,0.4);
-	text-transform: uppercase;
-	letter-spacing: 0.04em;
-}
+.tetra-slot-key { color: rgba(255,255,255,0.35); font-size: 0.78em; white-space: nowrap; align-self: center; }
+.tetra-slot-val { color: #ddd; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; align-self: center; }
+.tetra-issi { font-weight: 600; color: #eee; }
+.tetra-gssi { color: rgba(255,255,255,0.65); }
+.tetra-calltype { font-size: 0.78em; color: rgba(255,255,255,0.4); text-transform: uppercase; letter-spacing: 0.04em; }
