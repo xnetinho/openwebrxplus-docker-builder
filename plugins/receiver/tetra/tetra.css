@@ -1,4 +1,4 @@
-/* tetra plugin — panel layout v1.3 */
+/* tetra plugin — panel layout v1.4 */
 
 .tetra-panel {
 	display: flex;
@@ -8,7 +8,7 @@
 	padding: 0;
 	min-width: 580px;
 	width: max-content;
-	max-width: 720px;
+	max-width: 740px;
 	align-items: stretch;
 }
 
@@ -27,13 +27,13 @@
 	padding: 0 10px 4px;
 }
 
-.tetra-col-network   { flex: 0 0 200px; overflow: hidden; }
+.tetra-col-network   { flex: 0 0 215px; overflow: hidden; }
 .tetra-col-signal    { flex: 0 0 180px; overflow: hidden; }
 .tetra-col-timeslots { flex: 1 0 240px; overflow: hidden; }
 
 .tetra-grid {
 	display: grid;
-	grid-template-columns: 90px minmax(0, 1fr);
+	grid-template-columns: 95px minmax(0, 1fr);
 	column-gap: 8px;
 	row-gap: 3px;
 	padding: 0 10px;
@@ -58,11 +58,17 @@
 }
 .tetra-val.tetra-wide { white-space: normal; word-break: break-word; }
 
+/* Cell-level security capability (advertised by BS, informational) */
+.tetra-cellsec { font-weight: 600; align-self: center; }
+.tetra-cellsec.cell-none { color: rgba(255,255,255,0.5); }
+.tetra-cellsec.cell-tea  { color: #c8960a; }
+
+/* Per-call active encryption */
 .tetra-enc { font-weight: 600; align-self: center; }
 .tetra-enc.enc-tea  { color: #e05555; }
 .tetra-enc.enc-no   { color: #5cb85c; }
 .tetra-enc.enc-yes  { color: #e05555; }
-.tetra-enc.enc-cell { color: #c8960a; }
+.tetra-enc.enc-idle { color: rgba(255,255,255,0.5); }
 
 .tetra-signal-grid {
 	display: grid;
@@ -94,7 +100,9 @@
 	line-height: 1.35;
 }
 .tetra-status-line { color: #d4a857; }
+.tetra-status-line.idle { color: rgba(255,255,255,0.35); }
 .tetra-sds-line    { color: #7cb3e0; }
+.tetra-sds-line.idle { color: rgba(255,255,255,0.35); }
 
 .openwebrx-tetra-slot {
 	display: flex;
