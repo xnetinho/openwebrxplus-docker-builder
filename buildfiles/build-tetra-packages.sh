@@ -11,11 +11,11 @@ apt-get install -y --no-install-recommends \
     ca-certificates build-essential pkg-config git wget unzip \
     libosmocore-dev python3-dev
 
-# ── 1. Clone osmo-tetra-sq5bpf ───────────────────────────────────────────────
+# ── 1. Clone osmo-tetra-sq5bpf ───────────────────────────────────────────────────
 pinfo "Cloning osmo-tetra-sq5bpf..."
 git clone --depth 1 https://github.com/sq5bpf/osmo-tetra-sq5bpf /tmp/osmo-tetra
 
-# ── 2. ETSI ACELP codec — local copy, patch, compile ─────────────────────────
+# ── 2. ETSI ACELP codec — local copy, patch, compile ──────────────────────────────────
 pinfo "Building ETSI ACELP codec..."
 cd /tmp/osmo-tetra/etsi_codec-patches
 
@@ -34,19 +34,31 @@ else
     }
 fi
 
+# Use the newer codec.diff from sq5bpf/install-tetra-codec instead of the
+# 11-year-old patch bundled in osmo-tetra-sq5bpf. The newer one (~5KB larger)
+# adds keystream handling: Read_Tetra_File() is modified to consume a
+# keystream array and apply XOR after decode. Without it, the codec emits
+# silence/garbage on cells that advertise a security class.
+pinfo "Fetching latest codec.diff from sq5bpf/install-tetra-codec..."
+wget -qO codec.diff \
+    https://raw.githubusercontent.com/sq5bpf/install-tetra-codec/master/codec.diff || {
+    perror "Failed to download newer codec.diff; falling back to bundled patch."
+    git checkout codec.diff
+}
+
 # -L forces lowercase filenames (required for the patch to apply on Linux)
 unzip -q -L en_30039502v010301p0.zip
 patch -p1 -N -E < codec.diff
 cd c-code && make ${MAKEFLAGS}
 cp cdecoder sdecoder "$TETRA_INSTALL_DIR/"
 
-# ── 3. Build tetra-rx ─────────────────────────────────────────────────────────
+# ── 3. Build tetra-rx ──────────────────────────────────────────────────────────────────
 pinfo "Building tetra-rx..."
 cd /tmp/osmo-tetra/src
 make ${MAKEFLAGS} tetra-rx
 cp tetra-rx "$TETRA_INSTALL_DIR/"
 
-# ── 4. Export artifacts for the runtime stage ─────────────────────────────────
+# ── 4. Export artifacts for the runtime stage ───────────────────────────────────
 pinfo "Exporting build artifacts..."
 cp -r "$TETRA_INSTALL_DIR"/* /build_artifacts/tetra/
 pinfo "TETRA packages built successfully."
