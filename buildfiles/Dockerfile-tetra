@@ -5,6 +5,7 @@ ARG APT_PROXY
 
 COPY common.sh /
 COPY build-tetra-packages.sh /
+COPY files/en_30039502v010301p0.zip /tmp/en_30039502v010301p0.zip
 
 RUN --mount=type=cache,id=owrxp-tetra-buildcache,target=/build_cache \
     bash /build-tetra-packages.sh

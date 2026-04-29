@@ -15,17 +15,23 @@ apt-get install -y --no-install-recommends \
 pinfo "Cloning osmo-tetra-sq5bpf..."
 git clone --depth 1 https://github.com/sq5bpf/osmo-tetra-sq5bpf /tmp/osmo-tetra
 
-# ── 2. ETSI ACELP codec — download, patch, compile ───────────────────────────
+# ── 2. ETSI ACELP codec — local copy, patch, compile ─────────────────────────
 pinfo "Building ETSI ACELP codec..."
 cd /tmp/osmo-tetra/etsi_codec-patches
 
-wget -qO en_30039502v010301p0.zip \
-    "http://www.etsi.org/deliver/etsi_en/300300_300399/30039502/01.03.01_60/en_30039502v010301p0.zip" || {
-    perror "Failed to download ETSI ACELP codec."
-    perror "URL: http://www.etsi.org/deliver/etsi_en/300300_300399/30039502/01.03.01_60/en_30039502v010301p0.zip"
-    perror "If the URL changed, update build-tetra-packages.sh."
-    exit 1
-}
+if [ -f /tmp/en_30039502v010301p0.zip ]; then
+    pinfo "Using local copy of ETSI ACELP codec."
+    cp /tmp/en_30039502v010301p0.zip en_30039502v010301p0.zip
+else
+    pinfo "Downloading ETSI ACELP codec..."
+    wget -qO en_30039502v010301p0.zip \
+        "http://www.etsi.org/deliver/etsi_en/300300_300399/30039502/01.03.01_60/en_30039502v010301p0.zip" || {
+        perror "Failed to download ETSI ACELP codec."
+        perror "URL: http://www.etsi.org/deliver/etsi_en/300300_300399/30039502/01.03.01_60/en_30039502v010301p0.zip"
+        perror "If the URL changed, update build-tetra-packages.sh."
+        exit 1
+    }
+fi
 
 # -L forces lowercase filenames (required for the patch to apply on Linux)
 unzip -q -L en_30039502v010301p0.zip
