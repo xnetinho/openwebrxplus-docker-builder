@@ -10,11 +10,12 @@ Pipeline:
   stdin IQ -> GNURadio DQPSK demod -> tetra-rx -> UDP TETMON -> ACELP codec -> stdout PCM
                                                              -> JSON meta -> stderr
 
-Encryption semantics (corrected):
+Encryption semantics:
   - NETINFO1/ENCINFO1 carry the cell-level security class (TEA capability
     advertised by the BS). It is NOT a per-call encryption status.
   - The actual per-call encryption_mode is in the low nibble of the
-    Basicinfo byte (0=clear, 1=TEA1, 2=TEA2, 3=TEA3) per ETSI EN 300 392-2.
+    Basicinfo byte (0=clear, 1=TEA1, 2=TEA2, 3=TEA3, 4..15=reserved/proprietary)
+    per ETSI EN 300 392-2. Only 1/2/3 mark a real active encryption.
 """
 
 import json
@@ -31,18 +32,15 @@ TETRA_DIR = os.environ.get("TETRA_DIR", "/opt/openwebrx-tetra")
 
 ACELP_FRAME_SIZE = 1380
 PCM_OUTPUT_BYTES = 960
-AUDIO_HEADER_SIZE = 20
 
-# Primary pattern: traffic frame with TRA / RX / DECR fields (cell-level
-# encryption attempted by tetra-rx, regardless of whether the current call
-# is actually encrypted).
+# Primary pattern: traffic frame with TRA / RX / DECR fields.
 AUDIO_PATTERN = re.compile(
-    rb"TRA:([0-9a-fA-F]+)\s+RX:([0-9a-fA-F]+)\s+DECR:([0-9a-fA-F]+)"
+    rb"TRA:([0-9a-fA-F]+)\s+RX:([0-9a-fA-F]+)\s+DECR:([0-9a-fA-F]+)\s+"
 )
 
 # Fallback pattern: some builds / clear cells emit only TRA + RX without DECR.
 AUDIO_PATTERN_NO_DECR = re.compile(
-    rb"TRA:([0-9a-fA-F]+)\s+RX:([0-9a-fA-F]+)"
+    rb"TRA:([0-9a-fA-F]+)\s+RX:([0-9a-fA-F]+)\s+"
 )
 
 TEA_NAMES = {0: "none", 1: "TEA1", 2: "TEA2", 3: "TEA3"}
@@ -135,20 +133,24 @@ def find_free_port():
 def parse_audio_from_udp(data):
     """Extract a single ACELP frame from a TETMON UDP payload.
 
-    Returns the ACELP bytes, or None if the payload doesn't contain a
-    traffic frame. The pattern fallback handles tetra-rx variants that
-    omit the DECR field on clear calls.
+    Uses the actual regex match end as the offset into the binary ACELP
+    payload. The hex header width varies depending on the values of TRA/
+    RX/DECR (1 vs 2 hex digits), so a fixed offset would shift the codec
+    input by 1–3 bytes and produce silence/noise.
     """
     tra_pos = data.find(b'TRA:')
     if tra_pos < 0:
         return None
     payload = data[tra_pos:]
-    if len(payload) < AUDIO_HEADER_SIZE + ACELP_FRAME_SIZE:
+    match = AUDIO_PATTERN.match(payload)
+    if match is None:
+        match = AUDIO_PATTERN_NO_DECR.match(payload)
+        if match is None:
+            return None
+    offset = match.end()
+    if len(payload) < offset + ACELP_FRAME_SIZE:
         return None
-    if AUDIO_PATTERN.match(payload) is None and \
-            AUDIO_PATTERN_NO_DECR.match(payload) is None:
-        return None
-    return payload[AUDIO_HEADER_SIZE:AUDIO_HEADER_SIZE + ACELP_FRAME_SIZE]
+    return payload[offset:offset + ACELP_FRAME_SIZE]
 
 
 def parse_metadata_from_udp(data):
@@ -187,8 +189,8 @@ def parse_metadata_from_udp(data):
         except ValueError:
             color_code = int(ccode_raw) if ccode_raw.isdigit() else 0
         crypt = int(fields.get('CRYPT', '0'))
-        # CRYPT in NETINFO1 is the cell security class advertisement (TEA
-        # capability of the BS), not the active call encryption status.
+        # CRYPT in NETINFO1 is the cell security class advertisement
+        # (TEA capability of the BS), not the active call encryption.
         return {
             "protocol": "TETRA",
             "type": "netinfo",
@@ -199,8 +201,6 @@ def parse_metadata_from_udp(data):
             "color_code": color_code,
             "cell_security_class": crypt,
             "cell_tea": TEA_NAMES.get(crypt, f"unknown({crypt})"),
-            # Backwards-compat fields. The cell capability never implies
-            # that current voice traffic is encrypted, so encrypted=false.
             "encrypted": False,
             "encryption_type": "none",
             "la": fields.get('LA', ''),
@@ -258,16 +258,12 @@ def parse_metadata_from_udp(data):
 
     if func == 'ENCINFO1':
         crypt = int(fields.get('CRYPT', '0'))
-        # ENCINFO1 also describes cell-level encryption parameters, not
-        # the per-call active encryption.
         return {
             "protocol": "TETRA",
             "type": "encinfo",
             "cell_security_class": crypt,
             "cell_tea": TEA_NAMES.get(crypt, f"unknown({crypt})"),
             "enc_mode": fields.get('ENC', '00'),
-            # Backwards-compat: do not raise the panel encryption flag
-            # based on cell capability.
             "encrypted": False,
         }
 
@@ -374,7 +370,7 @@ def main():
     burst_rate = [0.0]
     burst_window_start = [time.monotonic()]
     call_type_info = [""]
-    call_enc_mode = [0]  # 0=clear, 1=TEA1, 2=TEA2, 3=TEA3
+    call_enc_mode = [0]  # 0=clear, 1=TEA1, 2=TEA2, 3=TEA3, 4-15 reserved
 
     re_sync = re.compile(r'TN \d+\((\d+)\)')
     re_access_dl = re.compile(r'DL_USAGE:\s*(\S+)')
@@ -382,12 +378,7 @@ def main():
     re_basicinfo = re.compile(r'Basicinfo:0x([0-9A-Fa-f]{2})')
 
     def decode_call_type(basicinfo_byte):
-        """Return (call_type_label, encryption_mode_int).
-
-        Per ETSI EN 300 392-2 Basicinfo:
-          bits 7..5: communication type (0=indiv, 1=group, 2=bcast, 3=ack-grp)
-          bits 3..0: encryption_mode (0=clear, 1=TEA1, 2=TEA2, 3=TEA3)
-        """
+        """Return (call_type_label, encryption_mode_int)."""
         cmt = (basicinfo_byte >> 5) & 0x07
         comm = basicinfo_byte & 0x0F
         types = {0: "individual", 1: "group", 2: "broadcast",
@@ -478,11 +469,17 @@ def main():
     }
 
     def annotate_call_encryption(meta):
-        """Attach per-call encryption flags from current Basicinfo state."""
+        """Attach per-call encryption flags from current Basicinfo state.
+
+        Only encryption_mode values 1/2/3 (TEA1/TEA2/TEA3) are treated as
+        an active encryption. Values 4-15 are reserved/proprietary per
+        ETSI EN 300 392-2 and must not raise the panel encryption flag
+        (otherwise the badge briefly flashes 'ENC NONE' in red).
+        """
         with state_lock:
             enc = call_enc_mode[0]
             ct = call_type_info[0]
-        meta["encrypted"] = enc > 0
+        meta["encrypted"] = enc in (1, 2, 3)
         meta["encryption_type"] = TEA_NAMES.get(enc, "none")
         if ct:
             meta["call_type"] = ct
@@ -533,7 +530,6 @@ def main():
                     annotate_call_encryption(meta)
 
                 if msg_type == "call_release":
-                    # Reset per-call encryption state
                     with state_lock:
                         call_enc_mode[0] = 0
                         call_type_info[0] = ""
