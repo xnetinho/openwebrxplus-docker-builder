@@ -25,9 +25,10 @@ if [ -f /tmp/en_30039502v010301p0.zip ]; then
 else
     pinfo "Downloading ETSI ACELP codec..."
     wget -qO en_30039502v010301p0.zip \
-        "http://www.etsi.org/deliver/etsi_en/300300_300399/30039502/01.03.01_60/en_30039502v010301p0.zip" || {
+        --header="User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" \
+        "https://www.etsi.org/deliver/etsi_en/300300_300399/30039502/01.03.01_60/en_30039502v010301p0.zip" || {
         perror "Failed to download ETSI ACELP codec."
-        perror "URL: http://www.etsi.org/deliver/etsi_en/300300_300399/30039502/01.03.01_60/en_30039502v010301p0.zip"
+        perror "URL: https://www.etsi.org/deliver/etsi_en/300300_300399/30039502/01.03.01_60/en_30039502v010301p0.zip"
         perror "If the URL changed, update build-tetra-packages.sh."
         exit 1
     }
