@@ -117,11 +117,19 @@ get_owrxp_commit() {
 # ── Lightweight build (softmbe / tetra) ──────────────────────────────────────
 # Builds images that extend a pre-existing Docker Hub base without the heavy
 # multi-stage compilation pipeline. No APT cache server required.
+#
+# Arguments:
+#   $1  DOCKERFILE   path to the Dockerfile
+#   $2  PROD_NAME    image name (without user prefix)
+#   $3  HUB_USER     Docker Hub user (default: DOCKER_HUB_USER)
+#   $4  CUSTOM_TAG   optional custom tag; if set, only this tag is created
+#                    (no 'latest', no version tag)
 
 build-light() {
   local DOCKERFILE="${1}"
   local PROD_NAME="${2}"
   local HUB_USER="${3:-${DOCKER_HUB_USER}}"
+  local CUSTOM_TAG="${4:-}"
 
   if [ ! -f "${DOCKERFILE}" ]; then
     log err "Cannot find Dockerfile '${DOCKERFILE}'"
@@ -134,7 +142,17 @@ build-light() {
 
   local VER
   VER=$(get_owrxp_version)
-  log inf "Building '${HUB_USER}/${PROD_NAME}:${VER}' from ${DOCKERFILE}"
+
+  # Build tag list: custom tag OR (version + latest)
+  local tag_args=()
+  if [ -n "${CUSTOM_TAG}" ]; then
+    log inf "Building '${HUB_USER}/${PROD_NAME}:${CUSTOM_TAG}' (custom tag) from ${DOCKERFILE}"
+    tag_args=(-t "${HUB_USER}/${PROD_NAME}:${CUSTOM_TAG}")
+  else
+    log inf "Building '${HUB_USER}/${PROD_NAME}:${VER}' + ':latest' from ${DOCKERFILE}"
+    tag_args=(-t "${HUB_USER}/${PROD_NAME}:${VER}" -t "${HUB_USER}/${PROD_NAME}:latest")
+  fi
+
   log inf "Using cache dir: ${CACHE_DIR}"
   echo
 
@@ -155,8 +173,7 @@ build-light() {
     --cache-to type=local,dest="${CACHE_DIR}" \
     --build-arg MAKEFLAGS="${MAKEFLAGS}" \
     --build-arg APT_PROXY="${APT_PROXY}" \
-    -t "${HUB_USER}/${PROD_NAME}:${VER}" \
-    -t "${HUB_USER}/${PROD_NAME}:latest" \
+    "${tag_args[@]}" \
     --pull \
     --push \
     ./buildfiles || exit 1
@@ -166,43 +183,81 @@ build-light() {
 # Builds the softmbe image directly from slechev/openwebrxplus on Docker Hub.
 # Does NOT require the heavy main-image compilation.
 # Chains into build-tetra automatically when done.
+#
+# Options:
+#   --tag TAG   use a custom tag instead of 'latest' + version
 
 build-softmbe() {
+  local CUSTOM_TAG=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --tag) CUSTOM_TAG="${2:?'--tag requires a value'}"; shift ;;
+      *) log war "Unknown option for build-softmbe: $1" ;;
+    esac
+    shift
+  done
+
   log inf "Building SoftMBE image directly from Docker Hub base..."
-  build-light "buildfiles/Dockerfile-softmbe" "${PRODUCT}-softmbe"
+  build-light "buildfiles/Dockerfile-softmbe" "${PRODUCT}-softmbe" "${DOCKER_HUB_USER}" "${CUSTOM_TAG}"
 
   log inf "SoftMBE build complete. Starting TETRA build..."
-  build-tetra
+  build-tetra ${CUSTOM_TAG:+--tag "${CUSTOM_TAG}"}
 }
 
 # ── build-tetra ───────────────────────────────────────────────────────────────
 # Builds the tetra image (xnetinho/openwebrxplus-tetra) from the softmbe base.
 # Does NOT require the heavy main-image compilation.
 # This is always the last step in the build chain — cleans up the builder.
+#
+# Options:
+#   --tag TAG   use a custom tag instead of 'latest' + version
+#               Example: ./run build-tetra --tag develop-tetra-frequency
 
 build-tetra() {
+  local CUSTOM_TAG=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --tag) CUSTOM_TAG="${2:?'--tag requires a value'}"; shift ;;
+      *) log war "Unknown option for build-tetra: $1" ;;
+    esac
+    shift
+  done
+
   log inf "Building TETRA image directly from SoftMBE base..."
-  build-light "buildfiles/Dockerfile-tetra" "${PRODUCT}-tetra" "${TETRA_DOCKER_HUB_USER}"
+  build-light "buildfiles/Dockerfile-tetra" "${PRODUCT}-tetra" "${TETRA_DOCKER_HUB_USER}" "${CUSTOM_TAG}"
 
   log inf "Removing docker builder (keeping state/caches for next use)..."
   docker buildx rm --keep-state owrxp-builder 2>/dev/null || true
 
-  log suc "Full build chain complete: ${DOCKER_HUB_USER}/${PRODUCT} → ${DOCKER_HUB_USER}/${PRODUCT}-softmbe → ${TETRA_DOCKER_HUB_USER}/${PRODUCT}-tetra"
+  if [ -n "${CUSTOM_TAG}" ]; then
+    log suc "Build complete: ${TETRA_DOCKER_HUB_USER}/${PRODUCT}-tetra:${CUSTOM_TAG}"
+  else
+    log suc "Full build chain complete: ${DOCKER_HUB_USER}/${PRODUCT} → ${DOCKER_HUB_USER}/${PRODUCT}-softmbe → ${TETRA_DOCKER_HUB_USER}/${PRODUCT}-tetra"
+  fi
 }
 
 # ── build (main — heavy) ─────────────────────────────────────────────────────
+#
+# Options:
+#   --force-final   bypass final layer cache
+#   --tag TAG       use a custom tag instead of 'latest' + version
 
 build() {
   check-apt || start-apt-cache
 
   local force_final
   force_final=0
-  local build_args
-  build_args=()
+  local CUSTOM_TAG=""
+  local build_args=()
+
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --force-final)
         force_final=1
+        ;;
+      --tag)
+        CUSTOM_TAG="${2:?'--tag requires a value'}"
+        shift
         ;;
       *)
         build_args+=("$1")
@@ -255,7 +310,17 @@ build() {
     FINAL_CACHE_BUSTER="force-$(date +%s)"
     log war "--force-final enabled: bypassing final layer cache (${FINAL_CACHE_BUSTER})."
   fi
-  log inf "Building '${PROD}${PRODUCT_EXTRA}:${VER}'"
+
+  # Build tag list: custom tag OR (version + latest)
+  local tag_args=()
+  if [ -n "${CUSTOM_TAG}" ]; then
+    log inf "Building '${PROD}${PRODUCT_EXTRA}:${CUSTOM_TAG}' (custom tag)"
+    tag_args=(-t "${DOCKER_HUB_USER}/${PROD}${PRODUCT_EXTRA}:${CUSTOM_TAG}")
+  else
+    log inf "Building '${PROD}${PRODUCT_EXTRA}:${VER}' + ':latest'"
+    tag_args=(-t "${DOCKER_HUB_USER}/${PROD}${PRODUCT_EXTRA}:${VER}" -t "${DOCKER_HUB_USER}/${PROD}${PRODUCT_EXTRA}")
+  fi
+
   log inf "OpenWebRX upstream commit key: ${OWRX_REPO_COMMIT}"
   echo
 
@@ -284,8 +349,7 @@ build() {
     --build-arg PRODUCT="${PROD}${PRODUCT_EXTRA}" \
     --build-arg OWRXVERSION="${VER}" \
     --build-arg APT_PROXY="${APT_PROXY}" \
-    -t "${DOCKER_HUB_USER}"/"${PROD}${PRODUCT_EXTRA}":"${VER}" \
-    -t "${DOCKER_HUB_USER}"/"${PROD}${PRODUCT_EXTRA}" \
+    "${tag_args[@]}" \
     --pull \
     --push \
     ./buildfiles || exit 1
@@ -293,7 +357,7 @@ build() {
   # Chain into lightweight softmbe → tetra builds
   if [[ "${PRODUCT_EXTRA}" != *softmbe* ]] && [[ "${PRODUCT_EXTRA}" != *tetra* ]]; then
     log inf "Main build complete. Starting SoftMBE + TETRA builds..."
-    build-softmbe
+    build-softmbe ${CUSTOM_TAG:+--tag "${CUSTOM_TAG}"}
   fi
 }
 
@@ -372,21 +436,26 @@ log "Builder for OpenWebRX+ Docker Image"
 check-docker
 
 usage() {
-  log war "Usage: $0 [command]"
+  log war "Usage: $0 [command] [options]"
   log war ". commands:"
-  log war "... build [--force-final] [Dockerfile]  - full build (heavy); chains softmbe→tetra automatically"
-  log war "... build-softmbe                        - build softmbe image from Docker Hub base; chains tetra"
-  log war "... build-tetra                          - build tetra image (${TETRA_DOCKER_HUB_USER}/${PRODUCT}-tetra) from softmbe base"
-  log war "... run [image]                          - run container from latest image"
-  log war "... run-softmbe                          - run softmbe container"
-  log war "... run-tetra                            - run tetra container"
-  log war "... dev [image]                          - start container with bash shell"
-  log war "... dev-tetra                            - start tetra container with bash shell"
-  log war "... add-admin                            - add 'admin' user to the running container"
-  log war "... clean [--yes]                        - remove builders, caches, apt-cache stack, and local work/cache"
+  log war "... build [--force-final] [--tag TAG] [Dockerfile]  - full build (heavy); chains softmbe→tetra automatically"
+  log war "... build-softmbe [--tag TAG]                        - build softmbe image from Docker Hub base; chains tetra"
+  log war "... build-tetra   [--tag TAG]                        - build tetra image (${TETRA_DOCKER_HUB_USER}/${PRODUCT}-tetra) from softmbe base"
+  log war "... run [image]                                       - run container from latest image"
+  log war "... run-softmbe                                       - run softmbe container"
+  log war "... run-tetra                                         - run tetra container"
+  log war "... dev [image]                                       - start container with bash shell"
+  log war "... dev-tetra                                         - start tetra container with bash shell"
+  log war "... add-admin                                         - add 'admin' user to the running container"
+  log war "... clean [--yes]                                     - remove builders, caches, apt-cache stack, and local work/cache"
   echo
   log war "Build chain: build → build-softmbe → build-tetra"
   log war "You can start at any point in the chain."
+  echo
+  log war "The --tag option creates a single custom tag instead of 'latest' + version:"
+  log war "[6[  ./run build-tetra --tag develop-tetra-frequency]]"
+  log war "[6[  ./run build-tetra --tag meu-teste-2]]"
+  log war "[6[  ./run build-softmbe --tag homolog]]   # aplica também ao build-tetra encadeado"
   echo
   log war "You can specify MAKEFLAGS for docker builds:"
   log war "[6[MAKEFLAGS=\"-j4\" $0]]"
