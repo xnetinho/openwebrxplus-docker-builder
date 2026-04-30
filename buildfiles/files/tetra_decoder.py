@@ -9,18 +9,23 @@ Writes JSON metadata to stderr (TETMON signaling: network info, calls).
 Debug: TETRA_DEBUG=1 -> dumps to /tmp/tetra-debug.log (override path with
 TETRA_DEBUG_FILE). Banner is written on every start regardless of flag.
 
-Key TETMON format facts (confirmed empirically from osmo-tetra-sq5bpf):
-  - Audio frames (no -e): 'TRA:HH RX:HH DECR:HH ' + 1380 bytes ACELP.
-    Audio frames (with -e): 'TRA:HH RX:HH\x00'   + 1380 bytes (passthrough).
+Key TETMON format facts (confirmed from osmo-tetra-sq5bpf source code):
+  - Audio frames (v1, our build): 'TRA:HH RX:HH\\x00' + 1380 bytes ACELP (13-byte header).
+  - Audio frames (v2, sq5bpf-2): 'TRA:HH RX:HH DECR:i\\x00' + 1380 bytes ACELP (20-byte header).
+    The DECR field (0=not decrypted, 1=decrypted with SCK) only appears in v2.
   - Per-call encryption indicator: 'ENCC:N' on DSETUPDEC/DCONNECTDEC/
     DTXGRANTDEC PDUs (0=clear, 1=TEA1, 2=TEA2, 3=TEA3).
   - Cell-level capability: 'CRYPT:N' on NETINFO1/ENCINFO1 (informational).
 
-We invoke tetra-rx WITHOUT '-e'. The flag emits frames from encrypted
-calls in a passthrough format that bypasses parts of the L2 decode and
-delivers garbled / mis-aligned bytes to the codec. The reference
-mbbrzoza/OpenWebRX-Tetra-Plugin runs without -e and emits frames in
-the standard 3-field format with proper DECR data on clear calls.
+We invoke tetra-rx WITHOUT '-e'. The '-e' flag enables encrypted-passthrough mode
+which emits frames with a different header format and mis-aligned payload that
+produces garbled audio on clear calls.
+
+Codec pipeline output alignment:
+  cdecoder produces 2 × (BFI + 137 params) = 276 shorts = 552 bytes per TETRA frame.
+  sdecoder produces 2 × 160 PCM shorts = 640 bytes per TETRA frame.
+  PCM_OUTPUT_BYTES MUST be 640 (a multiple of the 320-byte sub-frame boundary)
+  to prevent sub-frame misalignment that causes cyclic garble/clear audio.
 
 Codec pipeline is async: feeding ACELP into cdecoder.stdin never blocks
 the main loop. A dedicated reader thread pulls PCM from sdecoder.stdout
@@ -43,15 +48,21 @@ TETRA_DEBUG = os.environ.get("TETRA_DEBUG", "0") == "1"
 TETRA_DEBUG_FILE = os.environ.get("TETRA_DEBUG_FILE", "/tmp/tetra-debug.log")
 
 ACELP_FRAME_SIZE = 1380
-PCM_OUTPUT_BYTES = 960
 
-# Unified audio header pattern. Covers both observed formats:
-#   Standard (no -e): 'TRA:HH RX:HH DECR:HH '   3-field, space-terminated
-#   Passthrough (-e): 'TRA:HH RX:HH\x00'        2-field, NUL-terminated
-# We invoke tetra-rx without -e, so we should always hit the standard format.
+# Codec pipeline output size per TETRA frame.
+# One TETRA traffic frame → cdecoder → 2 × (BFI+137) = 276 shorts = 552 bytes
+# → sdecoder → 2 × 160 shorts PCM = 640 bytes (2 sub-frames × 320 bytes).
+# MUST be a multiple of 320 (one ACELP sub-frame = 15ms @ 8kHz s16le).
+# Previous value 960 (= 3 sub-frames) caused misalignment — every read crossed
+# sub-frame boundaries, producing periodic garble/clear cycling.
+PCM_OUTPUT_BYTES = 640
+
+# Unified audio header pattern. Covers both osmo-tetra-sq5bpf versions:
+#   v1 (original, our build): 'TRA:HH RX:HH\x00'  2-field, NUL-terminated (13 bytes)
+#   v2 (sq5bpf-2): 'TRA:HH RX:HH DECR:i\x00'      3-field with DECR (20 bytes)
 # match.end() points exactly at the start of the 1380-byte ACELP payload.
 AUDIO_PATTERN = re.compile(
-    rb"TRA:[0-9a-fA-F]+ +RX:[0-9a-fA-F]+(?: +DECR:[0-9a-fA-F]+ +|\x00)"
+    rb"TRA:[0-9a-fA-F]+ +RX:[0-9a-fA-F]+(?: +DECR:[0-9]+)?\x00"
 )
 
 TEA_NAMES = {0: "none", 1: "TEA1", 2: "TEA2", 3: "TEA3"}

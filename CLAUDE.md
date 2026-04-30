@@ -153,7 +153,7 @@ Patcha três arquivos do pacote `owrx` em build time:
 
 Pipeline persistente: `cdecoder → sdecoder`
 - **cdecoder**: channel decoding (entrada: 1380 bytes ACELP, saída: intermediate)
-- **sdecoder**: speech decoding (entrada: intermediate, saída: 960 bytes PCM)
+- **sdecoder**: speech decoding (entrada: intermediate, saída: 640 bytes PCM = 2 × 320-byte sub-frames)
 - Ambos requerem argumentos: `/dev/stdin /dev/stdout`
 - Sem argumentos → zombie imediato (exit 1)
 
@@ -169,6 +169,8 @@ Tipos: `NETINFO1`, `FREQINFO1`, `ENCINFO1`, `DSETUPDEC`, `DCONNECTDEC`,
 `DTXGRANTDEC`, `DRELEASEDEC`, `DSTATUSDEC`, `SDSDEC`, `BURST`.
 
 Audio: detectado por `b"TRA:"` no datagrama UDP, seguido de header e 1380 bytes ACELP.
+  - v1 (nosso build): `TRA:HH RX:HH\x00` (13-byte header, sem DECR)
+  - v2 (sq5bpf-2): `TRA:HH RX:HH DECR:i\x00` (20-byte header, com DECR)
 
 ---
 

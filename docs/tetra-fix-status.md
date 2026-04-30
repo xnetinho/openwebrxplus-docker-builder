@@ -141,6 +141,34 @@ overridable via `TETRA_DEBUG_FILE`). Line-buffered append. Always
 writes a startup banner regardless of TETRA_DEBUG, so users can
 verify the new code is actually running.
 
+### Bug 11 — PCM_OUTPUT_BYTES=960 misaligns sub-frame boundaries (FIXED — branch `claude/tetra-audio-fix-audio-codec-alignment`)
+
+Root cause of the garbled/clear cycling audio pattern the user recorded.
+
+The codec pipeline produces exactly 640 bytes of PCM per TETRA frame:
+  - cdecoder: 2 × (BFI + 137 params) = 276 shorts = 552 bytes
+  - sdecoder: 2 × 160 PCM shorts = 640 bytes (2 sub-frames × 320 bytes)
+
+`PCM_OUTPUT_BYTES` was set to 960 (3 × 320), which is NOT a multiple of
+the 640-byte frame boundary. Every `read(960)` crossed sub-frame boundaries:
+  - Read 1: bytes 0–959 → frame 0 (640) + partial frame 1 (320 of 640)
+  - Read 2: bytes 960–1919 → rest of frame 1 (320) + frame 2 (640)
+  - This 2-frame alignment slip creates a periodic pattern where every
+    3rd read starts at a wrong sub-frame boundary, producing garbled audio
+    alternating with ~67% somewhat-clear segments.
+
+Additionally, the AUDIO_PATTERN regex required `DECR:` followed by a
+hex value and space (or bare `\x00` as fallback). The v1 osmo-tetra-sq5bpf
+build (our build) uses the 2-field format `TRA:HH RX:HH\x00` (13-byte
+header) WITHOUT a DECR field at all. The regex matched via the fallback,
+but the docstring incorrectly described the header format.
+
+Fixed:
+  - `PCM_OUTPUT_BYTES` changed from 960 to 640
+  - `AUDIO_PATTERN` regex updated to match both v1 and v2 headers:
+    `TRA:HH RX:HH(\x00| DECR:i\x00)` with `match.end()` for dynamic offset
+  - Docstrings and CLAUDE.md updated with correct frame format docs
+
 ---
 
 ## What was done in this branch (commits in chronological order)
@@ -192,7 +220,7 @@ resource     func, ssi, idt, ssi2?
 | `[tetra-debug]` lines invisible in docker logs | -> /tmp/tetra-debug.log | YES (`00c45c2`) |
 | 0 ACELP frames extracted | -> ACELP extraction working | YES (in dump after `b47abd1`) |
 | Panel freezes on first ACELP | -> panel keeps updating | YES (`52d8833`) |
-| Periodic 300ms-intelligible voice | -> continuous voice (clear cells) | **PENDING REBUILD AFTER `fec8ff9`** |
+| Periodic garbled/clear cycling audio | -> continuous clear voice | **PENDING REBUILD (Bug 11 fix)** |
 | TEA1 false positive on clear calls | -> ENCC-derived encryption | YES (`b47abd1`) |
 
 ---
