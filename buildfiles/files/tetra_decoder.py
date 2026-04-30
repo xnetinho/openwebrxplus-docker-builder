@@ -9,8 +9,15 @@ call, matching the behavior of the OpenWebRX+ DMR/NXDN/YSF decoders.
 Writes JSON metadata to stderr (TETMON signaling: network info, calls, etc.).
 
 Debug: set TETRA_DEBUG=1 in the environment to dump raw TETMON UDP
-packets to stderr (hex+ascii prefix). Useful when audio is silent
-or noisy to confirm header layout, frame size, and field presence.
+packets and extracted ACELP frames to /tmp/tetra-debug.log inside the
+container. We use a file (not stderr) because stderr is captured by
+OpenWebRX+ csdr_module_tetra._read_meta() and non-JSON lines are silently
+logged at DEBUG level, which never reaches docker logs.
+
+A short startup banner is always written to /tmp/tetra-debug.log on every
+launch (even with TETRA_DEBUG=0), so you can confirm the new decoder
+is actually running:
+  cat /tmp/tetra-debug.log | head -1
 
 Pipeline:
   stdin IQ -> GNURadio DQPSK demod -> tetra-rx -> UDP TETMON -> ACELP codec -> stdout PCM
@@ -24,6 +31,7 @@ Encryption semantics:
     per ETSI EN 300 392-2. Only 1/2/3 mark a real active encryption.
 """
 
+import datetime
 import json
 import os
 import re
@@ -36,6 +44,7 @@ import time
 
 TETRA_DIR = os.environ.get("TETRA_DIR", "/opt/openwebrx-tetra")
 TETRA_DEBUG = os.environ.get("TETRA_DEBUG", "0") == "1"
+TETRA_DEBUG_FILE = os.environ.get("TETRA_DEBUG_FILE", "/tmp/tetra-debug.log")
 
 ACELP_FRAME_SIZE = 1380
 PCM_OUTPUT_BYTES = 960
@@ -49,6 +58,17 @@ AUDIO_PATTERN_NO_DECR = re.compile(
 
 TEA_NAMES = {0: "none", 1: "TEA1", 2: "TEA2", 3: "TEA3"}
 
+# Open the debug log once. Append mode so multiple decoder restarts
+# accumulate in the same file. Line-buffered so each dump is flushed
+# immediately (we want to read it from outside while it's running).
+try:
+    _DEBUG_FH = open(TETRA_DEBUG_FILE, 'a', buffering=1)
+    _DEBUG_FH.write('\n=== tetra_decoder.py startup at {} | TETRA_DEBUG={} ===\n'.format(
+        datetime.datetime.now().isoformat(timespec='seconds'),
+        'on' if TETRA_DEBUG else 'off'))
+except Exception as _e:
+    _DEBUG_FH = None
+
 
 def parse_tetmon_fields(data):
     fields = {}
@@ -58,17 +78,17 @@ def parse_tetmon_fields(data):
 
 
 def debug_dump(label, data, max_bytes=128):
-    """Dump a raw UDP packet to stderr for diagnosis (TETRA_DEBUG=1)."""
-    if not TETRA_DEBUG:
+    """Append a raw packet/frame dump to TETRA_DEBUG_FILE (TETRA_DEBUG=1)."""
+    if not TETRA_DEBUG or _DEBUG_FH is None:
         return
     body = data[:max_bytes]
     hex_str = ' '.join('{:02x}'.format(b) for b in body)
     ascii_str = ''.join(chr(b) if 32 <= b < 127 else '.' for b in body)
-    sys.stderr.write(
-        '[tetra-debug] {} len={} hex={} ascii={}\n'.format(
-            label, len(data), hex_str, ascii_str)
-    )
-    sys.stderr.flush()
+    try:
+        _DEBUG_FH.write('[{}] {} len={} hex={} ascii={}\n'.format(
+            time.strftime('%H:%M:%S'), label, len(data), hex_str, ascii_str))
+    except Exception:
+        pass
 
 
 class CodecPipeline:
@@ -490,9 +510,6 @@ def main():
         try:
             data, _ = sock.recvfrom(65535)
         except socket.timeout:
-            # No traffic from tetra-rx yet — leave the audio stream silent.
-            # Matches the DMR/NXDN/YSF decoder behavior in OpenWebRX+: PCM
-            # bytes are emitted only during actual voice frames.
             continue
         except Exception:
             break
@@ -536,13 +553,9 @@ def main():
                 emit_meta(meta)
                 last_emit_time[msg_type] = now
 
-        # Audio path: write PCM ONLY when we successfully decode an ACELP
-        # frame from the UDP packet. No silence padding — stream goes silent
-        # when no voice is active, just like the DMR decoder.
         acelp_data = parse_audio_from_udp(data)
         if acelp_data is not None:
-            if TETRA_DEBUG:
-                debug_dump('acelp', acelp_data, max_bytes=32)
+            debug_dump('acelp', acelp_data, max_bytes=32)
             pcm = codec.decode(acelp_data)
             if pcm:
                 try:
