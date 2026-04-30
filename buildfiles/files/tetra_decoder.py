@@ -10,18 +10,21 @@ Debug: TETRA_DEBUG=1 -> dumps to /tmp/tetra-debug.log (override path with
 TETRA_DEBUG_FILE). Banner is written on every start regardless of flag.
 
 Key TETMON format facts (confirmed empirically from osmo-tetra-sq5bpf):
-  - Audio frames: 'TRA:HH RX:HH\x00' (13-byte text header) + 1380 bytes
-    binary ACELP. NO 'DECR:' field in this build.
-  - Per-call encryption indicator: 'ENCC:N' field on DSETUPDEC /
-    DCONNECTDEC / DTXGRANTDEC PDUs (0=clear, 1=TEA1, 2=TEA2, 3=TEA3).
-  - Cell-level capability: 'CRYPT:N' on NETINFO1 / ENCINFO1 (informational).
+  - Audio frames (no -e): 'TRA:HH RX:HH DECR:HH ' + 1380 bytes ACELP.
+    Audio frames (with -e): 'TRA:HH RX:HH\x00'   + 1380 bytes (passthrough).
+  - Per-call encryption indicator: 'ENCC:N' on DSETUPDEC/DCONNECTDEC/
+    DTXGRANTDEC PDUs (0=clear, 1=TEA1, 2=TEA2, 3=TEA3).
+  - Cell-level capability: 'CRYPT:N' on NETINFO1/ENCINFO1 (informational).
+
+We invoke tetra-rx WITHOUT '-e'. The flag emits frames from encrypted
+calls in a passthrough format that bypasses parts of the L2 decode and
+delivers garbled / mis-aligned bytes to the codec. The reference
+mbbrzoza/OpenWebRX-Tetra-Plugin runs without -e and emits frames in
+the standard 3-field format with proper DECR data on clear calls.
 
 Codec pipeline is async: feeding ACELP into cdecoder.stdin never blocks
 the main loop. A dedicated reader thread pulls PCM from sdecoder.stdout
-and writes it to sys.stdout. Required because the install-tetra-codec
-patch (with keystream handling) buffers up to 5 frames before producing
-output — a synchronous read would block the UDP receive loop and freeze
-the whole decoder.
+and writes it to sys.stdout.
 """
 
 import datetime
@@ -42,6 +45,11 @@ TETRA_DEBUG_FILE = os.environ.get("TETRA_DEBUG_FILE", "/tmp/tetra-debug.log")
 ACELP_FRAME_SIZE = 1380
 PCM_OUTPUT_BYTES = 960
 
+# Unified audio header pattern. Covers both observed formats:
+#   Standard (no -e): 'TRA:HH RX:HH DECR:HH '   3-field, space-terminated
+#   Passthrough (-e): 'TRA:HH RX:HH\x00'        2-field, NUL-terminated
+# We invoke tetra-rx without -e, so we should always hit the standard format.
+# match.end() points exactly at the start of the 1380-byte ACELP payload.
 AUDIO_PATTERN = re.compile(
     rb"TRA:[0-9a-fA-F]+ +RX:[0-9a-fA-F]+(?: +DECR:[0-9a-fA-F]+ +|\x00)"
 )
@@ -78,16 +86,6 @@ def parse_tetmon_fields(data):
 
 
 class CodecPipeline:
-    """Asynchronous cdecoder|sdecoder ACELP -> PCM pipeline.
-
-    feed(acelp) writes to cdecoder.stdin and returns immediately.
-    A background reader thread continuously pulls PCM from sdecoder.stdout
-    and writes it to sys.stdout. This avoids a deadlock in the original
-    synchronous design when the codec buffers more than one input frame
-    before producing the first output (as the install-tetra-codec patch
-    does for keystream handling).
-    """
-
     def __init__(self):
         self._cdecoder = None
         self._sdecoder = None
@@ -119,11 +117,6 @@ class CodecPipeline:
         self._reader.start()
 
     def _reader_loop(self):
-        """Pump PCM from sdecoder.stdout straight to sys.stdout.
-
-        Reads in PCM_OUTPUT_BYTES chunks. On EOF or error, exits cleanly;
-        the next feed() will detect the dead pipeline and restart it.
-        """
         sd = self._sdecoder
         if sd is None or sd.stdout is None:
             return
@@ -144,7 +137,6 @@ class CodecPipeline:
             pass
 
     def feed(self, acelp_data):
-        """Write a single 1380-byte ACELP frame to cdecoder. Non-blocking."""
         with self._lock:
             if not self._started:
                 try: self.start()
@@ -344,7 +336,10 @@ def main():
 
     demod = subprocess.Popen(['python3', demod_path], stdin=0,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
-    tetra_rx_cmd = [tetra_rx_path, '-r', '-s', '-e', '/dev/stdin']
+    # Match the reference plugin (mbbrzoza/OpenWebRX-Tetra-Plugin) flags.
+    # Do NOT add '-e': it puts tetra-rx in encrypted-passthrough mode and
+    # breaks the audio frame format.
+    tetra_rx_cmd = [tetra_rx_path, '-r', '-s', '/dev/stdin']
     if os.path.isfile(keyfile):
         tetra_rx_cmd.extend(['-k', keyfile])
     tetra_rx = subprocess.Popen(tetra_rx_cmd, stdin=demod.stdout,
@@ -474,9 +469,6 @@ def main():
                 emit_meta(meta)
                 last_emit_time[msg_type] = now
 
-        # Audio path: feed ACELP into the codec asynchronously. PCM output
-        # comes out of the codec reader thread on its own schedule. Main
-        # loop never blocks waiting for the codec to produce a frame.
         acelp_data = parse_audio_from_udp(data)
         if acelp_data is not None:
             debug_dump('acelp', acelp_data, max_bytes=32)
