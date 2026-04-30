@@ -3,8 +3,14 @@
 Author: SP8MB (original), adaptado para container Docker.
 
 Reads complex float IQ from stdin (36 kS/s, centered on TETRA carrier).
-Writes PCM audio to stdout (8 kHz, 16-bit signed LE, mono).
+Writes PCM audio to stdout (8 kHz, 16-bit signed LE, mono) ONLY during
+active voice frames — stream goes silent (no bytes) when there is no
+call, matching the behavior of the OpenWebRX+ DMR/NXDN/YSF decoders.
 Writes JSON metadata to stderr (TETMON signaling: network info, calls, etc.).
+
+Debug: set TETRA_DEBUG=1 in the environment to dump raw TETMON UDP
+packets to stderr (hex+ascii prefix). Useful when audio is silent
+or noisy to confirm header layout, frame size, and field presence.
 
 Pipeline:
   stdin IQ -> GNURadio DQPSK demod -> tetra-rx -> UDP TETMON -> ACELP codec -> stdout PCM
@@ -29,16 +35,14 @@ import threading
 import time
 
 TETRA_DIR = os.environ.get("TETRA_DIR", "/opt/openwebrx-tetra")
+TETRA_DEBUG = os.environ.get("TETRA_DEBUG", "0") == "1"
 
 ACELP_FRAME_SIZE = 1380
 PCM_OUTPUT_BYTES = 960
 
-# Primary pattern: traffic frame with TRA / RX / DECR fields.
 AUDIO_PATTERN = re.compile(
     rb"TRA:([0-9a-fA-F]+)\s+RX:([0-9a-fA-F]+)\s+DECR:([0-9a-fA-F]+)\s+"
 )
-
-# Fallback pattern: some builds / clear cells emit only TRA + RX without DECR.
 AUDIO_PATTERN_NO_DECR = re.compile(
     rb"TRA:([0-9a-fA-F]+)\s+RX:([0-9a-fA-F]+)\s+"
 )
@@ -51,6 +55,20 @@ def parse_tetmon_fields(data):
     for m in re.finditer(rb'([A-Z_]+):([^\s]+)', data):
         fields[m.group(1).decode()] = m.group(2).decode()
     return fields
+
+
+def debug_dump(label, data, max_bytes=128):
+    """Dump a raw UDP packet to stderr for diagnosis (TETRA_DEBUG=1)."""
+    if not TETRA_DEBUG:
+        return
+    body = data[:max_bytes]
+    hex_str = ' '.join('{:02x}'.format(b) for b in body)
+    ascii_str = ''.join(chr(b) if 32 <= b < 127 else '.' for b in body)
+    sys.stderr.write(
+        '[tetra-debug] {} len={} hex={} ascii={}\n'.format(
+            label, len(data), hex_str, ascii_str)
+    )
+    sys.stderr.flush()
 
 
 class CodecPipeline:
@@ -134,9 +152,7 @@ def parse_audio_from_udp(data):
     """Extract a single ACELP frame from a TETMON UDP payload.
 
     Uses the actual regex match end as the offset into the binary ACELP
-    payload. The hex header width varies depending on the values of TRA/
-    RX/DECR (1 vs 2 hex digits), so a fixed offset would shift the codec
-    input by 1–3 bytes and produce silence/noise.
+    payload. Returns None when the packet is metadata-only.
     """
     tra_pos = data.find(b'TRA:')
     if tra_pos < 0:
@@ -189,8 +205,6 @@ def parse_metadata_from_udp(data):
         except ValueError:
             color_code = int(ccode_raw) if ccode_raw.isdigit() else 0
         crypt = int(fields.get('CRYPT', '0'))
-        # CRYPT in NETINFO1 is the cell security class advertisement
-        # (TEA capability of the BS), not the active call encryption.
         return {
             "protocol": "TETRA",
             "type": "netinfo",
@@ -370,7 +384,7 @@ def main():
     burst_rate = [0.0]
     burst_window_start = [time.monotonic()]
     call_type_info = [""]
-    call_enc_mode = [0]  # 0=clear, 1=TEA1, 2=TEA2, 3=TEA3, 4-15 reserved
+    call_enc_mode = [0]
 
     re_sync = re.compile(r'TN \d+\((\d+)\)')
     re_access_dl = re.compile(r'DL_USAGE:\s*(\S+)')
@@ -378,7 +392,6 @@ def main():
     re_basicinfo = re.compile(r'Basicinfo:0x([0-9A-Fa-f]{2})')
 
     def decode_call_type(basicinfo_byte):
-        """Return (call_type_label, encryption_mode_int)."""
         cmt = (basicinfo_byte >> 5) & 0x07
         comm = basicinfo_byte & 0x0F
         types = {0: "individual", 1: "group", 2: "broadcast",
@@ -456,10 +469,6 @@ def main():
     sock.bind(('127.0.0.1', udp_port))
     sock.settimeout(0.1)
 
-    silence_20ms = b'\x00' * 320
-    last_audio_time = time.monotonic()
-    SILENCE_INTERVAL = 0.020
-
     last_emit_time = {}
     RATE_LIMITS = {
         "burst": 0.5,
@@ -469,13 +478,6 @@ def main():
     }
 
     def annotate_call_encryption(meta):
-        """Attach per-call encryption flags from current Basicinfo state.
-
-        Only encryption_mode values 1/2/3 (TEA1/TEA2/TEA3) are treated as
-        an active encryption. Values 4-15 are reserved/proprietary per
-        ETSI EN 300 392-2 and must not raise the panel encryption flag
-        (otherwise the badge briefly flashes 'ENC NONE' in red).
-        """
         with state_lock:
             enc = call_enc_mode[0]
             ct = call_type_info[0]
@@ -488,20 +490,17 @@ def main():
         try:
             data, _ = sock.recvfrom(65535)
         except socket.timeout:
-            now = time.monotonic()
-            if now - last_audio_time > SILENCE_INTERVAL:
-                try:
-                    sys.stdout.buffer.write(silence_20ms)
-                    sys.stdout.buffer.flush()
-                    last_audio_time = now
-                except (BrokenPipeError, OSError):
-                    running = False
+            # No traffic from tetra-rx yet — leave the audio stream silent.
+            # Matches the DMR/NXDN/YSF decoder behavior in OpenWebRX+: PCM
+            # bytes are emitted only during actual voice frames.
             continue
         except Exception:
             break
 
         if tetra_rx.poll() is not None:
             break
+
+        debug_dump('udp', data)
 
         meta = parse_metadata_from_udp(data)
         if meta is not None:
@@ -537,23 +536,18 @@ def main():
                 emit_meta(meta)
                 last_emit_time[msg_type] = now
 
+        # Audio path: write PCM ONLY when we successfully decode an ACELP
+        # frame from the UDP packet. No silence padding — stream goes silent
+        # when no voice is active, just like the DMR decoder.
         acelp_data = parse_audio_from_udp(data)
         if acelp_data is not None:
+            if TETRA_DEBUG:
+                debug_dump('acelp', acelp_data, max_bytes=32)
             pcm = codec.decode(acelp_data)
             if pcm:
                 try:
                     sys.stdout.buffer.write(pcm)
                     sys.stdout.buffer.flush()
-                    last_audio_time = time.monotonic()
-                except (BrokenPipeError, OSError):
-                    running = False
-        else:
-            now = time.monotonic()
-            if now - last_audio_time > SILENCE_INTERVAL:
-                try:
-                    sys.stdout.buffer.write(silence_20ms)
-                    sys.stdout.buffer.flush()
-                    last_audio_time = now
                 except (BrokenPipeError, OSError):
                     running = False
 
