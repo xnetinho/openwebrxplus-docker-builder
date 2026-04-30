@@ -9,13 +9,19 @@ Writes JSON metadata to stderr (TETMON signaling: network info, calls).
 Debug: TETRA_DEBUG=1 -> dumps to /tmp/tetra-debug.log (override path with
 TETRA_DEBUG_FILE). Banner is written on every start regardless of flag.
 
-Key TETMON format facts (confirmed empirically from osmo-tetra-sq5bpf in
-this build):
+Key TETMON format facts (confirmed empirically from osmo-tetra-sq5bpf):
   - Audio frames: 'TRA:HH RX:HH\x00' (13-byte text header) + 1380 bytes
     binary ACELP. NO 'DECR:' field in this build.
   - Per-call encryption indicator: 'ENCC:N' field on DSETUPDEC /
     DCONNECTDEC / DTXGRANTDEC PDUs (0=clear, 1=TEA1, 2=TEA2, 3=TEA3).
   - Cell-level capability: 'CRYPT:N' on NETINFO1 / ENCINFO1 (informational).
+
+Codec pipeline is async: feeding ACELP into cdecoder.stdin never blocks
+the main loop. A dedicated reader thread pulls PCM from sdecoder.stdout
+and writes it to sys.stdout. Required because the install-tetra-codec
+patch (with keystream handling) buffers up to 5 frames before producing
+output — a synchronous read would block the UDP receive loop and freeze
+the whole decoder.
 """
 
 import datetime
@@ -36,10 +42,6 @@ TETRA_DEBUG_FILE = os.environ.get("TETRA_DEBUG_FILE", "/tmp/tetra-debug.log")
 ACELP_FRAME_SIZE = 1380
 PCM_OUTPUT_BYTES = 960
 
-# Unified audio header pattern. Covers both observed formats:
-#   New (this build): 'TRA:HH RX:HH\x00' (NUL terminator, no DECR field)
-#   Old (legacy):     'TRA:HH RX:HH DECR:HH ' (space-terminated, 3 fields)
-# match.end() points exactly at the start of the 1380-byte ACELP payload.
 AUDIO_PATTERN = re.compile(
     rb"TRA:[0-9a-fA-F]+ +RX:[0-9a-fA-F]+(?: +DECR:[0-9a-fA-F]+ +|\x00)"
 )
@@ -76,10 +78,21 @@ def parse_tetmon_fields(data):
 
 
 class CodecPipeline:
+    """Asynchronous cdecoder|sdecoder ACELP -> PCM pipeline.
+
+    feed(acelp) writes to cdecoder.stdin and returns immediately.
+    A background reader thread continuously pulls PCM from sdecoder.stdout
+    and writes it to sys.stdout. This avoids a deadlock in the original
+    synchronous design when the codec buffers more than one input frame
+    before producing the first output (as the install-tetra-codec patch
+    does for keystream handling).
+    """
+
     def __init__(self):
         self._cdecoder = None
         self._sdecoder = None
         self._lock = threading.Lock()
+        self._reader = None
         self._started = False
 
     def start(self):
@@ -101,25 +114,52 @@ class CodecPipeline:
             stdin=pipe_r, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         os.close(pipe_r)
         self._started = True
+        self._reader = threading.Thread(
+            target=self._reader_loop, name='codec-reader', daemon=True)
+        self._reader.start()
 
-    def decode(self, acelp_data):
+    def _reader_loop(self):
+        """Pump PCM from sdecoder.stdout straight to sys.stdout.
+
+        Reads in PCM_OUTPUT_BYTES chunks. On EOF or error, exits cleanly;
+        the next feed() will detect the dead pipeline and restart it.
+        """
+        sd = self._sdecoder
+        if sd is None or sd.stdout is None:
+            return
+        try:
+            while self._started:
+                pcm = sd.stdout.read(PCM_OUTPUT_BYTES)
+                if not pcm:
+                    break
+                if len(pcm) != PCM_OUTPUT_BYTES:
+                    continue
+                debug_dump('pcm', pcm, max_bytes=16)
+                try:
+                    sys.stdout.buffer.write(pcm)
+                    sys.stdout.buffer.flush()
+                except (BrokenPipeError, OSError):
+                    break
+        except Exception:
+            pass
+
+    def feed(self, acelp_data):
+        """Write a single 1380-byte ACELP frame to cdecoder. Non-blocking."""
         with self._lock:
             if not self._started:
                 try: self.start()
-                except Exception: return None
+                except Exception: return
             try:
-                if self._cdecoder.poll() is not None or self._sdecoder.poll() is not None:
-                    self.stop(); self.start()
+                if (self._cdecoder.poll() is not None or
+                        self._sdecoder.poll() is not None):
+                    self._stop_locked()
+                    self.start()
                 self._cdecoder.stdin.write(acelp_data)
                 self._cdecoder.stdin.flush()
-                pcm = self._sdecoder.stdout.read(PCM_OUTPUT_BYTES)
-                if pcm and len(pcm) == PCM_OUTPUT_BYTES:
-                    return pcm
             except (BrokenPipeError, OSError):
-                self.stop()
-            return None
+                self._stop_locked()
 
-    def stop(self):
+    def _stop_locked(self):
         self._started = False
         for proc in (self._cdecoder, self._sdecoder):
             if proc:
@@ -127,6 +167,10 @@ class CodecPipeline:
                 except Exception: pass
         self._cdecoder = None
         self._sdecoder = None
+
+    def stop(self):
+        with self._lock:
+            self._stop_locked()
 
 
 def find_free_port():
@@ -136,12 +180,6 @@ def find_free_port():
 
 
 def parse_audio_from_udp(data):
-    """Extract a 1380-byte ACELP frame from a TETMON UDP audio packet.
-
-    Returns the ACELP bytes or None if this packet is metadata-only.
-    Uses the unified AUDIO_PATTERN (covers both NUL- and space-terminated
-    header formats); match.end() yields the binary payload offset.
-    """
     tra_pos = data.find(b'TRA:')
     if tra_pos < 0:
         return None
@@ -156,7 +194,6 @@ def parse_audio_from_udp(data):
 
 
 def _enc_pair(fields):
-    """Return (encrypted_bool, encryption_type_str, encc_int) from ENCC field."""
     try:
         encc = int(fields.get('ENCC', '0'))
     except ValueError:
@@ -329,11 +366,6 @@ def main():
     re_access_a1 = re.compile(r'ACCESS1:\s*A/(\d+)')
     re_basicinfo = re.compile(r'Basicinfo:0x([0-9A-Fa-f]{2})')
 
-    # Basicinfo carries a packed byte from MLE/MM PDUs. The high bits map
-    # to a communication-type label (group/individual/etc). We DO NOT use
-    # the low nibble as encryption_mode — that interpretation produced
-    # false TEA1 reports (Bug 5 in roadmap). Per-call encryption now comes
-    # solely from the ENCC field of the call-setup PDUs.
     def decode_call_type(basicinfo_byte):
         cmt = (basicinfo_byte >> 5) & 0x07
         types = {0: "individual", 1: "group", 2: "broadcast",
@@ -442,16 +474,13 @@ def main():
                 emit_meta(meta)
                 last_emit_time[msg_type] = now
 
+        # Audio path: feed ACELP into the codec asynchronously. PCM output
+        # comes out of the codec reader thread on its own schedule. Main
+        # loop never blocks waiting for the codec to produce a frame.
         acelp_data = parse_audio_from_udp(data)
         if acelp_data is not None:
             debug_dump('acelp', acelp_data, max_bytes=32)
-            pcm = codec.decode(acelp_data)
-            if pcm:
-                try:
-                    sys.stdout.buffer.write(pcm)
-                    sys.stdout.buffer.flush()
-                except (BrokenPipeError, OSError):
-                    running = False
+            codec.feed(acelp_data)
 
     sock.close()
     codec.stop()
