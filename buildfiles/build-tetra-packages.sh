@@ -15,7 +15,7 @@ apt-get install -y --no-install-recommends \
 pinfo "Cloning osmo-tetra-sq5bpf..."
 git clone --depth 1 https://github.com/sq5bpf/osmo-tetra-sq5bpf /tmp/osmo-tetra
 
-# ── 2. ETSI ACELP codec — local copy, patch, compile ──────────────────────────────────
+# ── 2. ETSI ACELP codec — use the bundled patch from osmo-tetra-sq5bpf ────────
 pinfo "Building ETSI ACELP codec..."
 cd /tmp/osmo-tetra/etsi_codec-patches
 
@@ -34,17 +34,21 @@ else
     }
 fi
 
-# Use the newer codec.diff from sq5bpf/install-tetra-codec instead of the
-# 11-year-old patch bundled in osmo-tetra-sq5bpf. The newer one (~5KB larger)
-# adds keystream handling: Read_Tetra_File() is modified to consume a
-# keystream array and apply XOR after decode. Without it, the codec emits
-# silence/garbage on cells that advertise a security class.
-pinfo "Fetching latest codec.diff from sq5bpf/install-tetra-codec..."
-wget -qO codec.diff \
-    https://raw.githubusercontent.com/sq5bpf/install-tetra-codec/master/codec.diff || {
-    perror "Failed to download newer codec.diff; falling back to bundled patch."
-    git checkout codec.diff
-}
+# Use the codec.diff bundled with osmo-tetra-sq5bpf (no keystream handling).
+#
+# NOTE: an earlier revision of this script downloaded the newer codec.diff
+# from sq5bpf/install-tetra-codec, which adds keystream-handling support.
+# That patch interprets every 5th input frame as a keystream block and XORs
+# it into the decoded audio. Since we feed pure ACELP frames from tetra-rx
+# (no separate keystream stream), the patched codec corrupts every 5th
+# frame and produces intermittently intelligible / scrambled output, like
+# 300ms audible + 60ms garbled in a loop. The bundled patch decodes plain
+# ACELP without keystream interpretation, which is what we want when no
+# SCK is loaded.
+#
+# If you ever DO have an SCK keyfile and want keystream support, swap in
+# the install-tetra-codec patch AND modify tetra_decoder.py to interleave
+# a keystream frame every 4 ACELP frames in the codec input stream.
 
 # -L forces lowercase filenames (required for the patch to apply on Linux)
 unzip -q -L en_30039502v010301p0.zip
