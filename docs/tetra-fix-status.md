@@ -1,206 +1,180 @@
 # TETRA Frequency Monitoring Branch — Status & Roadmap
 
 Branch: `claude/tetra-frequency-monitoring-3IqM9`
-Started: 2026-04-29
+Last updated: 2026-04-30 (session 2)
 
 Purpose: fix the TETRA decoder pipeline so the OpenWebRX+ panel matches
 reality and unencrypted voice traffic plays back as audio.
 
 ---
 
-## Original problem (user report)
+## Bugs identified and current status
 
-On frequency 390.050 MHz, SDRSharp + TETRA plugin clearly demodulates
-voice (audible, intelligible) — proving the call is unencrypted. Our
-OpenWebRX+ build with the TETRA plugin shows:
+### Bug 1 — Cell capability vs. active-call encryption (FIXED — `7c740a1`)
 
-- Encryption badge: "TEA2" (red, alarming)
-- No audio output at all (silence)
+CRYPT field in NETINFO1 is the cell-level security-class advertisement
+(TEA capability of the BS), NOT the per-call encryption status. Old
+code treated it as 'this call is encrypted with TEAn'.
 
-## Root-cause analysis
+Fixed: NETINFO1 / ENCINFO1 emit `cell_security_class` and `cell_tea`
+fields (informational), with `encrypted=false`. Per-call encryption
+comes from a separate field (see Bug 5).
 
-Three distinct bugs were identified and worked on:
+### Bug 2 — Reserved enc_mode flashing red (FIXED — `175b1e8`)
 
-### Bug 1 — Cell capability vs. active-call encryption (FIXED)
+First version of `annotate_call_encryption` used `enc > 0`, so any
+Basicinfo low-nibble in the reserved range 4..15 produced
+`encrypted=true, encryption_type='none'` and the badge briefly flashed
+'ENC NONE' in red.
 
-The `CRYPT:` field in TETMON `NETINFO1` carries the cell-level security
-class advertisement (TEA capability of the BS), NOT the per-call encryption
-status. The previous code interpreted CRYPT as "this call is encrypted
-with TEAn", causing the badge to show TEA2 on every cell that merely
-advertises the capability.
+Fixed: `enc in (1, 2, 3)`. Later obsoleted by Bug 5 fix (Basicinfo
+is no longer used as the encryption source at all).
 
-Fixed in commit `7c740a1`:
-- NETINFO1/ENCINFO1 now emit `cell_security_class` + `cell_tea` fields
-  (informational), and `encrypted=false` for the network-level event.
-- Per-call `encrypted`/`encryption_type` derived from Basicinfo nibble
-  (later refined — see Bug 4).
+### Bug 3 — Audio header offset hardcoded (FIXED — `175b1e8`)
 
-### Bug 2 — Reserved encryption_mode values flashing red (FIXED)
+`AUDIO_HEADER_SIZE = 20` was a fixed offset assumption. Real header
+width varies (18..22 bytes) with the hex digit count of TRA/RX/DECR.
+Misalignment of 1–3 bytes shifted ACELP input and produced silence/noise.
 
-`Basicinfo` low nibble can be 0..15. Only 1/2/3 are TEA1/TEA2/TEA3 per
-ETSI EN 300 392-2; 4..15 are reserved/proprietary. The first version
-of `annotate_call_encryption` used `enc > 0`, so a Basicinfo with low
-nibble = 5 (e.g.) produced `encrypted=true, encryption_type="none"` and
-the panel briefly flashed `ENC NONE` in red.
+Fixed: `parse_audio_from_udp` uses `match.end()` of the regex to
+compute the binary payload offset dynamically.
 
-Fixed in commit `175b1e8`:
-- `meta["encrypted"] = enc in (1, 2, 3)`.
+### Bug 4 — Codec patch keystream handling DOESN'T HELP (REVERTED — `b5e19e8`)
 
-### Bug 3 — Audio header offset hardcoded (FIXED)
+First attempt was to swap the bundled `osmo-tetra-sq5bpf` codec.diff
+for the newer `sq5bpf/install-tetra-codec` patch (~5KB larger, with
+keystream-handling support). This made things worse:
 
-`AUDIO_HEADER_SIZE = 20` was a fixed offset into the TETMON UDP payload
-before the binary ACELP frame. The text header `TRA:%x RX:%x DECR:%x `
-varies from 18 to 22 bytes depending on hex digit count. The fixed
-offset shifted the codec input by 1–3 bytes, producing silence/noise
-even when the codec was healthy.
+The new patch interprets every 5th input frame as keystream and XORs
+it into the decoded audio. We feed pure ACELP from `tetra-rx` with no
+separate keystream stream, so every 5th frame corrupts the codec
+state — producing periodic ~300ms intelligible voice + ~60ms
+garbled in a loop.
 
-Fixed in commit `175b1e8`:
-- `parse_audio_from_udp` now uses `match.end()` from the regex.
-- Trailing whitespace included in the regex so end position is correct.
+Reverted to the bundled (11-year-old) codec.diff which decodes plain
+ACELP without keystream interpretation. Correct behavior when no SCK
+is loaded.
 
-### Bug 4 — Codec patch missing keystream handling (FIXED)
+### Bug 5 — Basicinfo low-nibble misread as encryption_mode (FIXED — `b47abd1`)
 
-The `codec.diff` bundled with `osmo-tetra-sq5bpf/etsi_codec-patches/` is
-11 years old (~14.8 KB). The standalone `sq5bpf/install-tetra-codec`
-repository ships a newer patch (~20.1 KB, last touched 2026-01-04) which
-adds keystream handling: `Read_Tetra_File()` is modified to consume a
-keystream array from the unused fifth frame slot and apply XOR after
-decode.
+The original code interpreted `Basicinfo:0xXY` as packed
+`call_type:encryption_mode`, parsing the low nibble as TEAn. Empirical
+data from the user's `tetra-debug.log` capture showed this is wrong;
+the authoritative per-call encryption comes from a different field.
 
-Without this, `cdecoder`/`sdecoder` produce silence/noise on cells that
-advertise a security class, even when the call is in clear.
+Fixed: extract `ENCC:N` from `DSETUPDEC` / `DCONNECTDEC` /
+`DTXGRANTDEC` PDUs. Basicinfo is now used only for the call_type label
+(high bits), without an appended TEAn suffix.
 
-Fixed in commit `ccabe18`:
-- `build-tetra-packages.sh` now downloads the newer codec.diff from
-  `install-tetra-codec` and applies it instead of the bundled one.
+### Bug 6 — Audio frame regex never matched (FIXED — `b47abd1`)
 
-### Bug 5 — Basicinfo low-nibble != encryption_mode (SUSPECTED, NOT FIXED)
+User's `tetra-debug.log` capture revealed the actual TETMON audio
+frame format from this build is `'TRA:HH RX:HH\x00<1380 ACELP bytes>'`
+— a 13-byte text header with NUL terminator, no DECR field. My
+original regex required `DECR:` and the fallback required `\s+` after
+RX (NUL is not `\s`). Result: 0 ACELP frames extracted out of 450
+audio packets. Persistent silence even when network was clear.
 
-User observation 2026-04-29: panel shows `Encryption: TEA1 (active)` on
-a call where SDRSharp clearly hears voice (i.e. the call is in clear).
-The `Basicinfo` byte from `tetra-rx` log is being interpreted as:
-  - bits 7..5 = call_type (individual / group / broadcast / acknowledged)
-  - bits 3..0 = encryption_mode
+Fixed: unified `AUDIO_PATTERN` matches both formats:
+  - `TRA:HH RX:HH\x00`              (passthrough mode, what -e emitted)
+  - `TRA:HH RX:HH DECR:HH `         (standard mode)
 
-This layout was inherited from the original SP8MB code without source
-citation. Reviewing `osmo-tetra-sq5bpf/src/lower_mac/upper_mac.c` shows
-that `Basicinfo` is printed for several MLE/MM PDUs and is NOT a
-uniform "call_type:enc_mode" packed byte. Treating its low nibble as
-`encryption_mode` produces false positives like the observed TEA1.
+### Bug 7 — Codec deadlocks the main loop (FIXED — `52d8833`)
 
-The authoritative source for per-call encryption is the `ENCR:` field
-in TETMON `DSETUPDEC` / `DCONNECTDEC` / `DTXGRANTDEC` PDUs, which our
-`parse_metadata_from_udp` currently ignores.
+Synchronous `decode()` writes 1380 bytes ACELP and immediately reads
+960 bytes PCM. If the codec buffers more than one input frame before
+producing output (which the install-tetra-codec patch did, before we
+reverted), `read()` blocks forever, the UDP receive loop freezes,
+the panel stops updating, the kernel socket buffer overflows, and
+the whole decoder appears hung until the user cycles the modulation.
 
-### Bug 6 — Audio still silent after rebuild (OPEN)
+Fixed: refactored CodecPipeline to be asynchronous. `feed()` writes
+to cdecoder.stdin and returns immediately; a background reader thread
+pulls 960-byte PCM chunks from sdecoder.stdout and emits them on
+sys.stdout when ready. Main loop never blocks on the codec.
 
-User confirmed Docker image was rebuilt with `ccabe18` (keystream patch)
-and `175b1e8` (header offset fix). Audio stream indicator shows
-10–14 kbps — too high for pure silence (which compresses to ~1–3 kbps
-with Opus), too low for clear voice (~15–25 kbps). The codec is
-producing PCM, but it's noise.
+### Bug 8 — `-e` flag corrupts audio (FIXED — `fec8ff9`)
 
-Hypotheses (not yet validated):
-  a) `match.end()` still does not align to the start of binary ACELP —
-     the regex matches text, but TETMON might insert extra delimiters,
-     padding, or a length byte before the binary payload.
-  b) `tetra-rx -e` is emitting frames where DECR contains the post-
-     decryption-attempt bytes from the WRONG SCK. Without keystream,
-     ACELP gets garbage. The new codec patch handles keystream, but only
-     if `tetra-rx` actually emits keystream bytes — which requires the
-     `-K` flag (or similar) we may not be setting.
-  c) The frame size constant `ACELP_FRAME_SIZE = 1380` may be wrong for
-     the patched codec; the new keystream-aware codec might expect a
-     different per-frame layout.
+Definitive fix found by comparing against the reference plugin
+`mbbrzoza/OpenWebRX-Tetra-Plugin`. Both projects use the same
+`osmo-tetra-sq5bpf` binary, but our `tetra-rx` invocation was
+`-r -s -e /dev/stdin` while the reference uses just `-r -s /dev/stdin`.
+
+The `-e` flag puts `tetra-rx` in encrypted-passthrough mode:
+  - frames from encrypted calls are emitted instead of dropped,
+  - the audio header switches from `TRA:HH RX:HH DECR:HH ` (3 fields,
+    space-terminated) to `TRA:HH RX:HH\x00` (2 fields, NUL-terminated),
+  - the bytes after the header are PRE-deinterleave passthrough, NOT
+    fully decoded ACELP.
+
+With -e on a clear cell, the codec receives mis-interleaved bytes that
+periodically align by chance and produce ~300ms intelligible voice
+fragments alternating with ~60ms garbled in a loop — the exact
+symptom the user reported. Without -e:
+  - clear cells: proper DECR-decoded ACELP -> intelligible audio.
+  - encrypted cells: tetra-rx drops frames, audio stream at 0 kbps.
+    Panel still correctly shows `Cell Sec.: TEAn (SC N)`.
+
+The AUDIO_PATTERN regex still tolerates both formats so passing -e
+for diagnostics doesn't break parsing.
+
+### Bug 9 — `silence_20ms` padding inflated stream rate (FIXED — `365ec98`)
+
+Decoder injected 20ms of zeros to stdout every 20ms whenever no ACELP
+frame was available, making the OWRX+ Audio stream indicator oscillate
+at 10–15 kbps even with no call. DMR decoder shows 0 kbps in the same
+situation.
+
+Fixed: removed all silence padding. PCM is now written only when the
+codec produces a real frame. Matches DMR/NXDN/YSF behavior — stream
+is silent (no bytes) when there is no voice activity.
+
+### Bug 10 — Debug output swallowed by csdr_module_tetra (FIXED — `00c45c2`)
+
+`csdr_module_tetra._read_meta()` captures the decoder's stderr and
+filters non-JSON lines to `logger.debug()`, which never reaches
+docker logs unless the entire OWRX+ logger is in DEBUG mode. The
+original debug_dump() wrote to stderr and was therefore invisible.
+
+Fixed: debug_dump now writes to a file (default `/tmp/tetra-debug.log`,
+overridable via `TETRA_DEBUG_FILE`). Line-buffered append. Always
+writes a startup banner regardless of TETRA_DEBUG, so users can
+verify the new code is actually running.
 
 ---
 
-## What was done in this branch (commits in order)
+## What was done in this branch (commits in chronological order)
 
 | SHA | File | Summary |
 |---|---|---|
-| `7c740a1` | `tetra_decoder.py` | NETINFO1/ENCINFO1 emit cell capability fields; Basicinfo nibble propagated to call events |
+| `7c740a1` | `tetra_decoder.py` | NETINFO1/ENCINFO1 emit cell capability fields, not encrypted=true |
 | `c38183f` | `plugins/receiver/tetra/{tetra.js,tetra.css}` | Mirror v1.3 frontend |
-| `ccabe18` | `build-tetra-packages.sh` | Switch codec.diff source to install-tetra-codec |
-| `175b1e8` | `tetra_decoder.py` | encrypted = enc in (1,2,3); match.end() for header offset |
-| `69276de` | `plugins/receiver/tetra/{tetra.js,tetra.css}` | Frontend v1.4: split Cell Sec / Encryption, always-show STATUS, broadcast label |
-
-(Plus equivalent commits on the `openwebrxplus-plugins` repo before we
-consolidated all work in this repo only.)
-
----
-
-## What remains (planned for next session)
-
-### Priority 1 — Diagnose the audio noise (Bug 6)
-
-1. Add a `TETRA_DEBUG=1` env-var path to `tetra_decoder.py` that, when
-   enabled, dumps raw TETMON UDP packets (hex + ascii prefix) to stderr.
-   Capture 5–10 packets from a known-clear cell.
-2. Compare the actual layout against the regex assumption. Look for:
-   - Length byte after the text header before binary ACELP.
-   - Extra fields like `SCK:` or `KSG:` between RX and DECR.
-   - The actual byte count of the binary payload (is it really 1380?).
-3. If `tetra-rx` requires a keystream-emit flag, add it.
-4. If `ACELP_FRAME_SIZE` is wrong, fix it.
-
-### Priority 2 — Replace Basicinfo encryption interpretation (Bug 5)
-
-1. Add `ENCR:` extraction to `parse_metadata_from_udp` for `DSETUPDEC`,
-   `DCONNECTDEC`, `DTXGRANTDEC`.
-2. Refactor `annotate_call_encryption` to prefer `ENCR:` from the PDU
-   itself over the cached Basicinfo nibble.
-3. If neither source is present, set `encryption_type="unknown"` and
-   render the badge as gray "Unknown" — never invent a TEA value.
-4. Validate the Basicinfo bit layout against osmo-tetra source. If
-   confirmed wrong, remove the `_TEA1/2/3` suffix from `call_type`.
-
-### Priority 3 — Audio gating decision
-
-Once encryption detection is reliable, decide whether the panel should:
-  - Always pipe codec output (current behavior), trusting the user to
-    mute when they see TEA-active.
-  - Actively gate codec output to silence when `encrypted=true` and no
-    `keyfile` is loaded (saves CPU on cdecoder/sdecoder).
-
-User preference TBD.
-
-### Priority 4 — STATUS code dictionary
-
-Once the user identifies the operator on 391.525 MHz / 381.525 MHz
-(MCC 724 / MNC 4321), populate `Plugins.tetra.statusNames` with known
-codes. Examples seen in field:
-  - 528: ?
-  - 4096: ?
-  - 55711: ?
-
-All observed in MMC=4321 cell. No public dictionary; needs operator
-contact or empirical observation.
-
-### Priority 5 — UI polish
-
-- TS slot icon stays visible after first burst even if no real call
-  metadata follows. Consider clearing the slot back to inactive after
-  N seconds of no `call_*` events.
-- Truncated `TypeACKNOWLEDGED GROUP T...` in slot should fit — tighten
-  font or grid columns.
+| `ccabe18` | `build-tetra-packages.sh` | Switch codec.diff to install-tetra-codec (later reverted) |
+| `175b1e8` | `tetra_decoder.py` | enc in (1,2,3); match.end() for header offset |
+| `69276de` | `plugins/receiver/tetra/{tetra.js,tetra.css}` | v1.4: split Cell Sec / Encryption, always-show STATUS |
+| `cfd357e` | `docs/tetra-fix-status.md` | Initial status doc |
+| `365ec98` | `tetra_decoder.py` | Remove silence_20ms padding; match DMR behavior |
+| `00c45c2` | `tetra_decoder.py` | Debug dump to file instead of stderr |
+| `b47abd1` | `tetra_decoder.py` | Unified AUDIO_PATTERN; ENCC for per-call encryption |
+| `52d8833` | `tetra_decoder.py` | Async codec pipeline (reader thread) |
+| `b5e19e8` | `build-tetra-packages.sh` | Revert codec.diff to bundled patch |
+| `fec8ff9` | `tetra_decoder.py` | Drop `-e` flag from tetra-rx (passthrough corruption) |
 
 ---
 
-## Reference: backend metadata schema (current)
+## Field schema (current)
 
 Events emitted to stderr by `tetra_decoder.py`, one JSON per line:
 
 ```
 netinfo      mcc, mnc, dl_freq, ul_freq, color_code,
-             cell_security_class, cell_tea,
+             cell_security_class (int), cell_tea (str),
              encrypted=false, encryption_type="none", la
 freqinfo     dl_freq, ul_freq
 encinfo      cell_security_class, cell_tea, enc_mode, encrypted=false
-call_setup   ssi, ssi2, call_id, idx,
-             encrypted, encryption_type, call_type        (annotated)
-call_connect ssi, ssi2, call_id, idx, encrypted, encryption_type, call_type
-tx_grant     ssi, ssi2, call_id, idx, encrypted, encryption_type, call_type
+call_setup   ssi, ssi2, call_id, idx, encc, encrypted, encryption_type, call_type
+call_connect ssi, ssi2, call_id, idx, encc, encrypted, encryption_type, call_type
+tx_grant     ssi, ssi2, call_id, idx, encc, encrypted, encryption_type, call_type
 call_release ssi, call_id
 status       ssi, ssi2, status
 sds          ssi, ssi2
@@ -208,6 +182,87 @@ burst        timeslots{}, afc, burst_rate, call_type
 resource     func, ssi, idt, ssi2?
 ```
 
-Note: per Bug 5, the `encrypted/encryption_type` annotation on call
-events is currently derived from suspect Basicinfo decoding and should
-be replaced with `ENCR:` extraction from the PDU itself.
+---
+
+## Validation status
+
+| Symptom | After fix | Confirmed |
+|---|---|---|
+| Audio stream at 10–15 kbps when idle | -> 0 kbps when idle | YES (`365ec98`) |
+| `[tetra-debug]` lines invisible in docker logs | -> /tmp/tetra-debug.log | YES (`00c45c2`) |
+| 0 ACELP frames extracted | -> ACELP extraction working | YES (in dump after `b47abd1`) |
+| Panel freezes on first ACELP | -> panel keeps updating | YES (`52d8833`) |
+| Periodic 300ms-intelligible voice | -> continuous voice (clear cells) | **PENDING REBUILD AFTER `fec8ff9`** |
+| TEA1 false positive on clear calls | -> ENCC-derived encryption | YES (`b47abd1`) |
+
+---
+
+## Open work
+
+### Test on a clear cell
+
+Commit `fec8ff9` (drop `-e`) is expected to be the final audio fix.
+Needs field validation on a cell with `cell_security_class = 0`. The
+user's primary test cell (391.525 / SC=2) will still produce no audio
+because we have no SCK; that's expected.
+
+Good test target: 390.050 (where the user originally heard voice via
+SDRSharp, indicating SC=0).
+
+### Frontend: SCK-locked badge state
+
+When `cell_security_class > 0` AND no keyfile is loaded, the panel
+currently shows green 'Clear' (correct per ENCC=0 semantics, but
+misleading because the call is wrapped in air-interface encryption
+the user can't decode). Proposed visual:
+
+| Cell SC | ENCC | Badge | Color |
+|---|---|---|---|
+| 0 | 0 | Clear | green |
+| 0 | 1/2/3 | TEAn (active) | red |
+| >0 | 0 | Air-encrypted (SCK) | orange |
+| >0 | 1/2/3 | TEAn + SCK | red |
+
+Not yet implemented. Holding until the audio path is confirmed working.
+
+### STATUS code dictionary
+
+Observed codes on MNC 4321 (Brazil, custom operator):
+  - 528, 4096, 17624, 55711
+
+No public dictionary; would need operator contact or empirical mapping
+(observe codes alongside known events). Plugins.tetra.statusNames is
+ready to be populated at runtime from a user config.
+
+### TS slot stale state
+
+If a `call_setup` arrives but no matching `call_release`, the TS slot
+stays 'active' indefinitely (icon visible, ISSI/GSSI dashes). Worth
+adding a soft timeout (~30s of no `call_*` events for that slot ->
+clear it). Cosmetic.
+
+---
+
+## Reference comparison: mbbrzoza/OpenWebRX-Tetra-Plugin
+
+During session 2 we compared our pipeline against
+[mbbrzoza/OpenWebRX-Tetra-Plugin](https://github.com/mbbrzoza/OpenWebRX-Tetra-Plugin),
+which uses the same `osmo-tetra-sq5bpf` upstream and ETSI codec. Key
+diffs found:
+
+| Aspect | Reference | Ours (post-fixes) |
+|---|---|---|
+| `tetra-rx` flags | `-r -s` | `-r -s` (after `fec8ff9`) |
+| Codec patch | bundled osmo-tetra-sq5bpf | bundled (after `b5e19e8`) |
+| Builds float_to_bits | yes (unused at runtime) | no (not needed) |
+| Codec call style | synchronous | async via reader thread |
+| Silence padding | yes (legacy) | removed (`365ec98`) |
+| Debug dumps | none | TETRA_DEBUG=1 -> file |
+| Encryption source | Basicinfo low nibble | ENCC field |
+| Cell-cap vs call-enc | merged | separated (`Cell Sec.` row) |
+
+The reference does not split cell-capability from active-call encryption,
+nor does it use the ENCC field. Our improvements there go beyond what
+the reference does. The audio pipeline differences after our fixes are
+functionally equivalent on clear cells; ours is more resilient on
+encrypted cells (no deadlock, lower kbps when idle).
