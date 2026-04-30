@@ -1,7 +1,7 @@
 # TETRA Frequency Monitoring Branch — Status & Roadmap
 
 Branch: `claude/tetra-frequency-monitoring-3IqM9`
-Last updated: 2026-04-30 (session 2)
+Last updated: 2026-04-30 (session 3)
 
 Purpose: fix the TETRA decoder pipeline so the OpenWebRX+ panel matches
 reality and unencrypted voice traffic plays back as audio.
@@ -141,6 +141,58 @@ overridable via `TETRA_DEBUG_FILE`). Line-buffered append. Always
 writes a startup banner regardless of TETRA_DEBUG, so users can
 verify the new code is actually running.
 
+### Bug 11 — Audio still mixed clear+scrambled after all fixes (OPEN — diagnostic step `6ff2e36`)
+
+Even after applying every fix above, on a cell reported as `Cell Sec.:
+TEA2 / Encryption: Clear` (391.525), the user still hears intelligible
+speech mixed with scrambled segments. PCM IS being produced (~251
+chunks of 960 bytes per debug dump), the input ACELP stream looks
+uniform (`TRA:39`, first byte `0x21` consistently), and yet the output
+is partly garbled. Observed PCM emission rate ≈ 50% of real-time, hinting
+at frame loss or rate mismatch somewhere in the chain.
+
+Hypotheses still on the table:
+1. Codec input-format mismatch (cdecoder may expect bit-soft-decision
+   int16 per bit, not packed bytes).
+2. OWRX+ post-processing chain (Opus encoder, resampler) introduces
+   the artefacts AFTER our decoder writes clean PCM.
+3. osmo-tetra-sq5bpf upstream is delivering frames that are partially
+   from encrypted bursts even though ENCC=0.
+
+**Diagnostic step (commit `6ff2e36`):** added `TETRA_PCM_DUMP` env var
+to `tetra_decoder.py`. When set, every PCM chunk emitted to stdout is
+also appended to the given file. This isolates the codec output from
+the OpenWebRX+ post-processing chain.
+
+User instructions:
+
+```sh
+# 1. Pull the latest image with the new env support
+docker pull <image>
+
+# 2. Add to your container env (Portainer / docker-compose):
+TETRA_DEBUG=1
+TETRA_DEBUG_FILE=/tmp/tetra-debug.log
+TETRA_PCM_DUMP=/tmp/tetra-pcm.raw
+
+# 3. Tune to the test frequency, let a clear call play for ~30 s.
+
+# 4. Copy the file out:
+docker cp <container>:/tmp/tetra-pcm.raw .
+
+# 5. Listen offline:
+aplay -r 8000 -f S16_LE -c 1 tetra-pcm.raw
+```
+
+Decision tree from the result:
+  - **PCM is intelligible offline (clean voice in `aplay`)**: the codec
+    is correct; the artefact is introduced by OWRX+'s Opus encoder /
+    resampler / WebSocket chain. Fix moves to `csdr_module_tetra.py`
+    or the audio output stage.
+  - **PCM is also scrambled offline**: the artefact is in our pipeline.
+    Look at codec input format (try bit-unpack), frame timing, or
+    osmo-tetra-sq5bpf upstream behavior on TEA2-capable cells.
+
 ---
 
 ## What was done in this branch (commits in chronological order)
@@ -159,6 +211,7 @@ verify the new code is actually running.
 | `52d8833` | `tetra_decoder.py` | Async codec pipeline (reader thread) |
 | `b5e19e8` | `build-tetra-packages.sh` | Revert codec.diff to bundled patch |
 | `fec8ff9` | `tetra_decoder.py` | Drop `-e` flag from tetra-rx (passthrough corruption) |
+| `6ff2e36` | `tetra_decoder.py` | Add TETRA_PCM_DUMP env for offline `aplay` diagnosis |
 
 ---
 
@@ -192,22 +245,19 @@ resource     func, ssi, idt, ssi2?
 | `[tetra-debug]` lines invisible in docker logs | -> /tmp/tetra-debug.log | YES (`00c45c2`) |
 | 0 ACELP frames extracted | -> ACELP extraction working | YES (in dump after `b47abd1`) |
 | Panel freezes on first ACELP | -> panel keeps updating | YES (`52d8833`) |
-| Periodic 300ms-intelligible voice | -> continuous voice (clear cells) | **PENDING REBUILD AFTER `fec8ff9`** |
+| Periodic 300ms-intelligible voice | -> still mixed clear+scrambled | NO — see Bug 11 |
 | TEA1 false positive on clear calls | -> ENCC-derived encryption | YES (`b47abd1`) |
 
 ---
 
 ## Open work
 
-### Test on a clear cell
+### Bug 11 PCM-dump diagnosis (next user-side step)
 
-Commit `fec8ff9` (drop `-e`) is expected to be the final audio fix.
-Needs field validation on a cell with `cell_security_class = 0`. The
-user's primary test cell (391.525 / SC=2) will still produce no audio
-because we have no SCK; that's expected.
-
-Good test target: 390.050 (where the user originally heard voice via
-SDRSharp, indicating SC=0).
+See Bug 11 above. After the user listens to `tetra-pcm.raw` offline with
+`aplay`, the next code change goes either into the decoder pipeline or
+into OWRX+'s audio output chain. Holding all other work until that
+result.
 
 ### Frontend: SCK-locked badge state
 
