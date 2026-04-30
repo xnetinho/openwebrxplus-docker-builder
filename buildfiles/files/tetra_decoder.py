@@ -9,6 +9,12 @@ Writes JSON metadata to stderr (TETMON signaling: network info, calls).
 Debug: TETRA_DEBUG=1 -> dumps to /tmp/tetra-debug.log (override path with
 TETRA_DEBUG_FILE). Banner is written on every start regardless of flag.
 
+PCM capture: TETRA_PCM_DUMP=/path/to/file.raw -> appends every PCM chunk
+emitted to stdout into the file as well. Listen offline with:
+  aplay -r 8000 -f S16_LE -c 1 /path/to/file.raw
+This isolates whether garbled audio comes from the codec output or from
+the OpenWebRX+ post-processing chain (Opus encoder, downsampling).
+
 Key TETMON format facts (confirmed empirically from osmo-tetra-sq5bpf):
   - Audio frames (no -e): 'TRA:HH RX:HH DECR:HH ' + 1380 bytes ACELP.
     Audio frames (with -e): 'TRA:HH RX:HH\x00'   + 1380 bytes (passthrough).
@@ -41,6 +47,7 @@ import time
 TETRA_DIR = os.environ.get("TETRA_DIR", "/opt/openwebrx-tetra")
 TETRA_DEBUG = os.environ.get("TETRA_DEBUG", "0") == "1"
 TETRA_DEBUG_FILE = os.environ.get("TETRA_DEBUG_FILE", "/tmp/tetra-debug.log")
+TETRA_PCM_DUMP = os.environ.get("TETRA_PCM_DUMP", "")
 
 ACELP_FRAME_SIZE = 1380
 PCM_OUTPUT_BYTES = 960
@@ -58,11 +65,19 @@ TEA_NAMES = {0: "none", 1: "TEA1", 2: "TEA2", 3: "TEA3"}
 
 try:
     _DEBUG_FH = open(TETRA_DEBUG_FILE, 'a', buffering=1)
-    _DEBUG_FH.write('\n=== tetra_decoder.py startup at {} | TETRA_DEBUG={} ===\n'.format(
+    _DEBUG_FH.write('\n=== tetra_decoder.py startup at {} | TETRA_DEBUG={} | PCM_DUMP={} ===\n'.format(
         datetime.datetime.now().isoformat(timespec='seconds'),
-        'on' if TETRA_DEBUG else 'off'))
+        'on' if TETRA_DEBUG else 'off',
+        TETRA_PCM_DUMP or 'off'))
 except Exception:
     _DEBUG_FH = None
+
+_PCM_DUMP_FH = None
+if TETRA_PCM_DUMP:
+    try:
+        _PCM_DUMP_FH = open(TETRA_PCM_DUMP, 'ab', buffering=0)
+    except Exception:
+        _PCM_DUMP_FH = None
 
 
 def debug_dump(label, data, max_bytes=128):
@@ -128,6 +143,11 @@ class CodecPipeline:
                 if len(pcm) != PCM_OUTPUT_BYTES:
                     continue
                 debug_dump('pcm', pcm, max_bytes=16)
+                if _PCM_DUMP_FH is not None:
+                    try:
+                        _PCM_DUMP_FH.write(pcm)
+                    except Exception:
+                        pass
                 try:
                     sys.stdout.buffer.write(pcm)
                     sys.stdout.buffer.flush()
