@@ -1,34 +1,21 @@
 #!/usr/bin/env python3
 """TETRA decoder wrapper for OpenWebRX+.
-Author: SP8MB (original), adaptado para container Docker.
 
 Reads complex float IQ from stdin (36 kS/s, centered on TETRA carrier).
 Writes PCM audio to stdout (8 kHz, 16-bit signed LE, mono) ONLY during
-active voice frames — stream goes silent (no bytes) when there is no
-call, matching the behavior of the OpenWebRX+ DMR/NXDN/YSF decoders.
-Writes JSON metadata to stderr (TETMON signaling: network info, calls, etc.).
+active voice frames — stream goes silent when no call is in progress.
+Writes JSON metadata to stderr (TETMON signaling: network info, calls).
 
-Debug: set TETRA_DEBUG=1 in the environment to dump raw TETMON UDP
-packets and extracted ACELP frames to /tmp/tetra-debug.log inside the
-container. We use a file (not stderr) because stderr is captured by
-OpenWebRX+ csdr_module_tetra._read_meta() and non-JSON lines are silently
-logged at DEBUG level, which never reaches docker logs.
+Debug: TETRA_DEBUG=1 -> dumps to /tmp/tetra-debug.log (override path with
+TETRA_DEBUG_FILE). Banner is written on every start regardless of flag.
 
-A short startup banner is always written to /tmp/tetra-debug.log on every
-launch (even with TETRA_DEBUG=0), so you can confirm the new decoder
-is actually running:
-  cat /tmp/tetra-debug.log | head -1
-
-Pipeline:
-  stdin IQ -> GNURadio DQPSK demod -> tetra-rx -> UDP TETMON -> ACELP codec -> stdout PCM
-                                                             -> JSON meta -> stderr
-
-Encryption semantics:
-  - NETINFO1/ENCINFO1 carry the cell-level security class (TEA capability
-    advertised by the BS). It is NOT a per-call encryption status.
-  - The actual per-call encryption_mode is in the low nibble of the
-    Basicinfo byte (0=clear, 1=TEA1, 2=TEA2, 3=TEA3, 4..15=reserved/proprietary)
-    per ETSI EN 300 392-2. Only 1/2/3 mark a real active encryption.
+Key TETMON format facts (confirmed empirically from osmo-tetra-sq5bpf in
+this build):
+  - Audio frames: 'TRA:HH RX:HH\x00' (13-byte text header) + 1380 bytes
+    binary ACELP. NO 'DECR:' field in this build.
+  - Per-call encryption indicator: 'ENCC:N' field on DSETUPDEC /
+    DCONNECTDEC / DTXGRANTDEC PDUs (0=clear, 1=TEA1, 2=TEA2, 3=TEA3).
+  - Cell-level capability: 'CRYPT:N' on NETINFO1 / ENCINFO1 (informational).
 """
 
 import datetime
@@ -49,36 +36,26 @@ TETRA_DEBUG_FILE = os.environ.get("TETRA_DEBUG_FILE", "/tmp/tetra-debug.log")
 ACELP_FRAME_SIZE = 1380
 PCM_OUTPUT_BYTES = 960
 
+# Unified audio header pattern. Covers both observed formats:
+#   New (this build): 'TRA:HH RX:HH\x00' (NUL terminator, no DECR field)
+#   Old (legacy):     'TRA:HH RX:HH DECR:HH ' (space-terminated, 3 fields)
+# match.end() points exactly at the start of the 1380-byte ACELP payload.
 AUDIO_PATTERN = re.compile(
-    rb"TRA:([0-9a-fA-F]+)\s+RX:([0-9a-fA-F]+)\s+DECR:([0-9a-fA-F]+)\s+"
-)
-AUDIO_PATTERN_NO_DECR = re.compile(
-    rb"TRA:([0-9a-fA-F]+)\s+RX:([0-9a-fA-F]+)\s+"
+    rb"TRA:[0-9a-fA-F]+ +RX:[0-9a-fA-F]+(?: +DECR:[0-9a-fA-F]+ +|\x00)"
 )
 
 TEA_NAMES = {0: "none", 1: "TEA1", 2: "TEA2", 3: "TEA3"}
 
-# Open the debug log once. Append mode so multiple decoder restarts
-# accumulate in the same file. Line-buffered so each dump is flushed
-# immediately (we want to read it from outside while it's running).
 try:
     _DEBUG_FH = open(TETRA_DEBUG_FILE, 'a', buffering=1)
     _DEBUG_FH.write('\n=== tetra_decoder.py startup at {} | TETRA_DEBUG={} ===\n'.format(
         datetime.datetime.now().isoformat(timespec='seconds'),
         'on' if TETRA_DEBUG else 'off'))
-except Exception as _e:
+except Exception:
     _DEBUG_FH = None
 
 
-def parse_tetmon_fields(data):
-    fields = {}
-    for m in re.finditer(rb'([A-Z_]+):([^\s]+)', data):
-        fields[m.group(1).decode()] = m.group(2).decode()
-    return fields
-
-
 def debug_dump(label, data, max_bytes=128):
-    """Append a raw packet/frame dump to TETRA_DEBUG_FILE (TETRA_DEBUG=1)."""
     if not TETRA_DEBUG or _DEBUG_FH is None:
         return
     body = data[:max_bytes]
@@ -91,9 +68,14 @@ def debug_dump(label, data, max_bytes=128):
         pass
 
 
-class CodecPipeline:
-    """Persistent cdecoder|sdecoder subprocess pipeline."""
+def parse_tetmon_fields(data):
+    fields = {}
+    for m in re.finditer(rb'([A-Z_]+):([^\s]+)', data):
+        fields[m.group(1).decode()] = m.group(2).decode()
+    return fields
 
+
+class CodecPipeline:
     def __init__(self):
         self._cdecoder = None
         self._sdecoder = None
@@ -103,43 +85,31 @@ class CodecPipeline:
     def start(self):
         cdecoder_path = os.path.join(TETRA_DIR, 'cdecoder')
         sdecoder_path = os.path.join(TETRA_DIR, 'sdecoder')
-
         if not os.path.isfile(cdecoder_path) or not os.path.isfile(sdecoder_path):
             for p in ['/tetra/bin', '/usr/local/bin']:
                 if os.path.isfile(os.path.join(p, 'cdecoder')):
                     cdecoder_path = os.path.join(p, 'cdecoder')
                     sdecoder_path = os.path.join(p, 'sdecoder')
                     break
-
         pipe_r, pipe_w = os.pipe()
-
         self._cdecoder = subprocess.Popen(
             [cdecoder_path, '/dev/stdin', '/dev/stdout'],
-            stdin=subprocess.PIPE, stdout=pipe_w, stderr=subprocess.DEVNULL
-        )
+            stdin=subprocess.PIPE, stdout=pipe_w, stderr=subprocess.DEVNULL)
         os.close(pipe_w)
-
         self._sdecoder = subprocess.Popen(
             [sdecoder_path, '/dev/stdin', '/dev/stdout'],
-            stdin=pipe_r, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-        )
+            stdin=pipe_r, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         os.close(pipe_r)
-
         self._started = True
 
     def decode(self, acelp_data):
         with self._lock:
             if not self._started:
-                try:
-                    self.start()
-                except Exception:
-                    return None
+                try: self.start()
+                except Exception: return None
             try:
-                if (self._cdecoder.poll() is not None or
-                        self._sdecoder.poll() is not None):
-                    self.stop()
-                    self.start()
-
+                if self._cdecoder.poll() is not None or self._sdecoder.poll() is not None:
+                    self.stop(); self.start()
                 self._cdecoder.stdin.write(acelp_data)
                 self._cdecoder.stdin.flush()
                 pcm = self._sdecoder.stdout.read(PCM_OUTPUT_BYTES)
@@ -153,11 +123,8 @@ class CodecPipeline:
         self._started = False
         for proc in (self._cdecoder, self._sdecoder):
             if proc:
-                try:
-                    proc.kill()
-                    proc.wait(timeout=1)
-                except Exception:
-                    pass
+                try: proc.kill(); proc.wait(timeout=1)
+                except Exception: pass
         self._cdecoder = None
         self._sdecoder = None
 
@@ -169,10 +136,11 @@ def find_free_port():
 
 
 def parse_audio_from_udp(data):
-    """Extract a single ACELP frame from a TETMON UDP payload.
+    """Extract a 1380-byte ACELP frame from a TETMON UDP audio packet.
 
-    Uses the actual regex match end as the offset into the binary ACELP
-    payload. Returns None when the packet is metadata-only.
+    Returns the ACELP bytes or None if this packet is metadata-only.
+    Uses the unified AUDIO_PATTERN (covers both NUL- and space-terminated
+    header formats); match.end() yields the binary payload offset.
     """
     tra_pos = data.find(b'TRA:')
     if tra_pos < 0:
@@ -180,13 +148,20 @@ def parse_audio_from_udp(data):
     payload = data[tra_pos:]
     match = AUDIO_PATTERN.match(payload)
     if match is None:
-        match = AUDIO_PATTERN_NO_DECR.match(payload)
-        if match is None:
-            return None
+        return None
     offset = match.end()
     if len(payload) < offset + ACELP_FRAME_SIZE:
         return None
     return payload[offset:offset + ACELP_FRAME_SIZE]
+
+
+def _enc_pair(fields):
+    """Return (encrypted_bool, encryption_type_str, encc_int) from ENCC field."""
+    try:
+        encc = int(fields.get('ENCC', '0'))
+    except ValueError:
+        encc = 0
+    return (encc in (1, 2, 3), TEA_NAMES.get(encc, "none"), encc)
 
 
 def parse_metadata_from_udp(data):
@@ -198,143 +173,105 @@ def parse_metadata_from_udp(data):
         payload = data[func_pos:]
     else:
         end = data.find(b'TETMON_end', begin)
-        if end < 0:
-            payload = data[begin + len(b'TETMON_begin'):]
-        else:
-            payload = data[begin + len(b'TETMON_begin'):end]
+        payload = data[begin + len(b'TETMON_begin'):end] if end >= 0 else data[begin + len(b'TETMON_begin'):]
     payload = payload.strip()
 
     fields = parse_tetmon_fields(payload)
     func = fields.get('FUNC', '')
-    func_match = re.search(rb'FUNC:(\S+(?:\s+(?!SSI:|IDX:|IDT:|ENCR:|RX:|CID:|NID:|CCODE:|MCC:|MNC:)\S+)*)', payload)
+    func_match = re.search(rb'FUNC:(\S+(?:\s+(?!SSI:|IDX:|IDT:|ENCR:|ENCC:|RX:|CID:|NID:|CCODE:|MCC:|MNC:|TXGRANT:|TXPERM:)\S+)*)', payload)
     if func_match:
         func = func_match.group(1).decode()
 
     if func == 'NETINFO1':
-        mcc_raw = fields.get('MCC', '0')
-        mnc_raw = fields.get('MNC', '0')
-        try:
-            mcc = int(mcc_raw, 16)
-            mnc = int(mnc_raw, 16)
-        except ValueError:
-            mcc = int(mcc_raw) if mcc_raw.isdigit() else 0
-            mnc = int(mnc_raw) if mnc_raw.isdigit() else 0
-        ccode_raw = fields.get('CCODE', '0')
-        try:
-            color_code = int(ccode_raw, 16)
-        except ValueError:
-            color_code = int(ccode_raw) if ccode_raw.isdigit() else 0
+        try: mcc = int(fields.get('MCC', '0'), 16)
+        except ValueError: mcc = 0
+        try: mnc = int(fields.get('MNC', '0'), 16)
+        except ValueError: mnc = 0
+        try: color_code = int(fields.get('CCODE', '0'), 16)
+        except ValueError: color_code = 0
         crypt = int(fields.get('CRYPT', '0'))
         return {
-            "protocol": "TETRA",
-            "type": "netinfo",
-            "mcc": mcc,
-            "mnc": mnc,
+            "protocol": "TETRA", "type": "netinfo",
+            "mcc": mcc, "mnc": mnc,
             "dl_freq": int(fields.get('DLF', '0')),
             "ul_freq": int(fields.get('ULF', '0')),
             "color_code": color_code,
             "cell_security_class": crypt,
             "cell_tea": TEA_NAMES.get(crypt, f"unknown({crypt})"),
-            "encrypted": False,
-            "encryption_type": "none",
+            "encrypted": False, "encryption_type": "none",
             "la": fields.get('LA', ''),
         }
 
     if func == 'FREQINFO1':
-        return {
-            "protocol": "TETRA",
-            "type": "freqinfo",
-            "dl_freq": int(fields.get('DLF', '0')),
-            "ul_freq": int(fields.get('ULF', '0')),
-        }
+        return {"protocol": "TETRA", "type": "freqinfo",
+                "dl_freq": int(fields.get('DLF', '0')),
+                "ul_freq": int(fields.get('ULF', '0'))}
 
     if func == 'DSETUPDEC':
-        return {
-            "protocol": "TETRA",
-            "type": "call_setup",
-            "ssi": int(fields.get('SSI', '0')),
-            "ssi2": int(fields.get('SSI2', '0')),
-            "call_id": int(fields.get('CID', '0')),
-            "idx": int(fields.get('IDX', '0')),
-        }
+        enc, enc_type, encc = _enc_pair(fields)
+        return {"protocol": "TETRA", "type": "call_setup",
+                "ssi": int(fields.get('SSI', '0')),
+                "ssi2": int(fields.get('SSI2', '0')),
+                "call_id": int(fields.get('CID', '0')),
+                "idx": int(fields.get('IDX', '0')),
+                "encc": encc, "encrypted": enc, "encryption_type": enc_type}
 
     if func in ('DRELEASEDEC', 'D-RELEASE'):
-        return {
-            "protocol": "TETRA",
-            "type": "call_release",
-            "ssi": int(fields.get('SSI', '0')),
-            "call_id": int(fields.get('CID', '0')),
-        }
+        return {"protocol": "TETRA", "type": "call_release",
+                "ssi": int(fields.get('SSI', '0')),
+                "call_id": int(fields.get('CID', '0'))}
 
     if func == 'DCONNECTDEC':
-        result = {
-            "protocol": "TETRA",
-            "type": "call_connect",
-            "ssi": int(fields.get('SSI', '0')),
-            "call_id": int(fields.get('CID', '0')),
-            "idx": int(fields.get('IDX', '0')),
-        }
+        enc, enc_type, encc = _enc_pair(fields)
+        result = {"protocol": "TETRA", "type": "call_connect",
+                  "ssi": int(fields.get('SSI', '0')),
+                  "call_id": int(fields.get('CID', '0')),
+                  "idx": int(fields.get('IDX', '0')),
+                  "encc": encc, "encrypted": enc, "encryption_type": enc_type}
         if 'SSI2' in fields:
             result["ssi2"] = int(fields['SSI2'])
         return result
 
     if func == 'DTXGRANTDEC':
-        result = {
-            "protocol": "TETRA",
-            "type": "tx_grant",
-            "ssi": int(fields.get('SSI', '0')),
-            "call_id": int(fields.get('CID', '0')),
-            "idx": int(fields.get('IDX', '0')),
-        }
+        enc, enc_type, encc = _enc_pair(fields)
+        result = {"protocol": "TETRA", "type": "tx_grant",
+                  "ssi": int(fields.get('SSI', '0')),
+                  "call_id": int(fields.get('CID', '0')),
+                  "idx": int(fields.get('IDX', '0')),
+                  "encc": encc, "encrypted": enc, "encryption_type": enc_type}
         if 'SSI2' in fields:
             result["ssi2"] = int(fields['SSI2'])
         return result
 
     if func == 'ENCINFO1':
         crypt = int(fields.get('CRYPT', '0'))
-        return {
-            "protocol": "TETRA",
-            "type": "encinfo",
-            "cell_security_class": crypt,
-            "cell_tea": TEA_NAMES.get(crypt, f"unknown({crypt})"),
-            "enc_mode": fields.get('ENC', '00'),
-            "encrypted": False,
-        }
+        return {"protocol": "TETRA", "type": "encinfo",
+                "cell_security_class": crypt,
+                "cell_tea": TEA_NAMES.get(crypt, f"unknown({crypt})"),
+                "enc_mode": fields.get('ENC', '00'),
+                "encrypted": False}
 
     if func == 'DSTATUSDEC':
-        return {
-            "protocol": "TETRA",
-            "type": "status",
-            "ssi": int(fields.get('SSI', '0')),
-            "ssi2": int(fields.get('SSI2', '0')),
-            "status": fields.get('STATUS', ''),
-        }
+        return {"protocol": "TETRA", "type": "status",
+                "ssi": int(fields.get('SSI', '0')),
+                "ssi2": int(fields.get('SSI2', '0')),
+                "status": fields.get('STATUS', '')}
 
     if func == 'BURST':
-        return {
-            "protocol": "TETRA",
-            "type": "burst",
-        }
+        return {"protocol": "TETRA", "type": "burst"}
 
     if func == 'SDSDEC':
-        return {
-            "protocol": "TETRA",
-            "type": "sds",
-            "ssi": int(fields.get('SSI', '0')),
-            "ssi2": int(fields.get('SSI2', '0')),
-        }
+        return {"protocol": "TETRA", "type": "sds",
+                "ssi": int(fields.get('SSI', '0')),
+                "ssi2": int(fields.get('SSI2', '0'))}
 
     if func.startswith('D-') and 'IDT' in fields:
         ssi = int(fields.get('SSI', '0'))
         ssi2 = int(fields.get('SSI2', '0')) if 'SSI2' in fields else 0
         if ssi > 0 or ssi2 > 0:
-            result = {
-                "protocol": "TETRA",
-                "type": "resource",
-                "func": func,
-                "ssi": ssi,
-                "idt": int(fields.get('IDT', '0')),
-            }
+            result = {"protocol": "TETRA", "type": "resource",
+                      "func": func, "ssi": ssi,
+                      "idt": int(fields.get('IDT', '0'))}
             if ssi2 > 0:
                 result["ssi2"] = ssi2
             return result
@@ -344,8 +281,7 @@ def parse_metadata_from_udp(data):
 
 def emit_meta(meta_dict):
     try:
-        line = json.dumps(meta_dict) + '\n'
-        sys.stderr.write(line)
+        sys.stderr.write(json.dumps(meta_dict) + '\n')
         sys.stderr.flush()
     except (BrokenPipeError, OSError):
         pass
@@ -353,16 +289,13 @@ def emit_meta(meta_dict):
 
 def main():
     running = True
-
     def shutdown(signum, frame):
         nonlocal running
         running = False
-
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
 
     udp_port = find_free_port()
-
     env = os.environ.copy()
     env['TETRA_HACK_PORT'] = str(udp_port)
     env['TETRA_HACK_IP'] = '127.0.0.1'
@@ -372,30 +305,16 @@ def main():
     tetra_rx_path = os.path.join(TETRA_DIR, 'tetra-rx')
     demod_path = os.path.join(TETRA_DIR, 'tetra_demod.py')
 
-    demod = subprocess.Popen(
-        ['python3', demod_path],
-        stdin=0,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=env
-    )
-
+    demod = subprocess.Popen(['python3', demod_path], stdin=0,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
     tetra_rx_cmd = [tetra_rx_path, '-r', '-s', '-e', '/dev/stdin']
     if os.path.isfile(keyfile):
         tetra_rx_cmd.extend(['-k', keyfile])
-
-    tetra_rx = subprocess.Popen(
-        tetra_rx_cmd,
-        stdin=demod.stdout,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        env=env
-    )
-
+    tetra_rx = subprocess.Popen(tetra_rx_cmd, stdin=demod.stdout,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
     demod.stdout.close()
 
     codec = CodecPipeline()
-
     state_lock = threading.Lock()
     ts_usage = {1: "unknown", 2: "unknown", 3: "unknown", 4: "unknown"}
     current_tn = [0]
@@ -404,62 +323,52 @@ def main():
     burst_rate = [0.0]
     burst_window_start = [time.monotonic()]
     call_type_info = [""]
-    call_enc_mode = [0]
 
     re_sync = re.compile(r'TN \d+\((\d+)\)')
     re_access_dl = re.compile(r'DL_USAGE:\s*(\S+)')
     re_access_a1 = re.compile(r'ACCESS1:\s*A/(\d+)')
     re_basicinfo = re.compile(r'Basicinfo:0x([0-9A-Fa-f]{2})')
 
+    # Basicinfo carries a packed byte from MLE/MM PDUs. The high bits map
+    # to a communication-type label (group/individual/etc). We DO NOT use
+    # the low nibble as encryption_mode — that interpretation produced
+    # false TEA1 reports (Bug 5 in roadmap). Per-call encryption now comes
+    # solely from the ENCC field of the call-setup PDUs.
     def decode_call_type(basicinfo_byte):
         cmt = (basicinfo_byte >> 5) & 0x07
-        comm = basicinfo_byte & 0x0F
         types = {0: "individual", 1: "group", 2: "broadcast",
                  3: "acknowledged group"}
-        cmt_str = types.get(cmt, "other")
-        if 1 <= comm <= 3:
-            cmt_str += " " + TEA_NAMES[comm]
-        return cmt_str, comm
+        return types.get(cmt, "other")
 
     def parse_tetra_rx_stdout():
         fd = tetra_rx.stdout.fileno()
         try:
             while True:
                 chunk = os.read(fd, 16384)
-                if not chunk:
-                    break
+                if not chunk: break
                 text = chunk.decode(errors='replace')
                 for m in re_sync.finditer(text):
-                    tn = int(m.group(1))
-                    if tn == 0:
-                        tn = 1
+                    tn = int(m.group(1)) or 1
                     current_tn[0] = tn
-
                 for line in text.split('\n'):
                     if 'ACCESS-ASSIGN' in line:
                         tn = current_tn[0]
-                        if not (1 <= tn <= 4):
-                            continue
+                        if not (1 <= tn <= 4): continue
                         with state_lock:
                             m = re_access_dl.search(line)
                             if m:
-                                usage = m.group(1)
-                                ts_usage[tn] = "unallocated" if usage.startswith('U') else "assigned"
+                                ts_usage[tn] = "unallocated" if m.group(1).startswith('U') else "assigned"
                                 continue
                             m = re_access_a1.search(line)
                             if m:
-                                val = int(m.group(1))
-                                ts_usage[tn] = "assigned" if 1 <= val <= 3 else "unallocated"
-
+                                v = int(m.group(1))
+                                ts_usage[tn] = "assigned" if 1 <= v <= 3 else "unallocated"
                     if 'Basicinfo' in line:
                         m = re_basicinfo.search(line)
                         if m:
-                            bi = int(m.group(1), 16)
-                            ct, enc = decode_call_type(bi)
+                            ct = decode_call_type(int(m.group(1), 16))
                             with state_lock:
                                 call_type_info[0] = ct
-                                call_enc_mode[0] = enc
-
         except (ValueError, OSError):
             pass
 
@@ -467,8 +376,7 @@ def main():
         try:
             for line in demod.stderr:
                 line = line.strip()
-                if not line:
-                    continue
+                if not line: continue
                 try:
                     data = json.loads(line)
                     if 'afc' in data:
@@ -479,10 +387,8 @@ def main():
         except (ValueError, OSError):
             pass
 
-    stdout_thread = threading.Thread(target=parse_tetra_rx_stdout, daemon=True)
-    stdout_thread.start()
-    demod_stderr_thread = threading.Thread(target=read_demod_stderr, daemon=True)
-    demod_stderr_thread.start()
+    threading.Thread(target=parse_tetra_rx_stdout, daemon=True).start()
+    threading.Thread(target=read_demod_stderr, daemon=True).start()
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -490,21 +396,7 @@ def main():
     sock.settimeout(0.1)
 
     last_emit_time = {}
-    RATE_LIMITS = {
-        "burst": 0.5,
-        "netinfo": 5.0,
-        "freqinfo": 10.0,
-        "encinfo": 5.0,
-    }
-
-    def annotate_call_encryption(meta):
-        with state_lock:
-            enc = call_enc_mode[0]
-            ct = call_type_info[0]
-        meta["encrypted"] = enc in (1, 2, 3)
-        meta["encryption_type"] = TEA_NAMES.get(enc, "none")
-        if ct:
-            meta["call_type"] = ct
+    RATE_LIMITS = {"burst": 0.5, "netinfo": 5.0, "freqinfo": 10.0, "encinfo": 5.0}
 
     while running:
         try:
@@ -513,7 +405,6 @@ def main():
             continue
         except Exception:
             break
-
         if tetra_rx.poll() is not None:
             break
 
@@ -524,9 +415,7 @@ def main():
             now = time.monotonic()
             msg_type = meta.get("type")
             rate_limit = RATE_LIMITS.get(msg_type, 0)
-            last_t = last_emit_time.get(msg_type, 0)
-
-            if now - last_t >= rate_limit:
+            if now - last_emit_time.get(msg_type, 0) >= rate_limit:
                 if msg_type == "burst":
                     burst_count[0] += 1
                     elapsed = now - burst_window_start[0]
@@ -534,7 +423,6 @@ def main():
                         burst_rate[0] = burst_count[0] / elapsed
                         burst_count[0] = 0
                         burst_window_start[0] = now
-
                     with state_lock:
                         meta["timeslots"] = {str(k): v for k, v in ts_usage.items()}
                         meta["afc"] = afc_value[0]
@@ -543,11 +431,12 @@ def main():
                             meta["call_type"] = call_type_info[0]
 
                 if msg_type in ("call_setup", "call_connect", "tx_grant"):
-                    annotate_call_encryption(meta)
+                    with state_lock:
+                        if call_type_info[0]:
+                            meta["call_type"] = call_type_info[0]
 
                 if msg_type == "call_release":
                     with state_lock:
-                        call_enc_mode[0] = 0
                         call_type_info[0] = ""
 
                 emit_meta(meta)
@@ -567,14 +456,10 @@ def main():
     sock.close()
     codec.stop()
     for proc in (tetra_rx, demod):
-        try:
-            proc.terminate()
-            proc.wait(timeout=2)
+        try: proc.terminate(); proc.wait(timeout=2)
         except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
+            try: proc.kill()
+            except Exception: pass
 
 
 if __name__ == '__main__':
