@@ -3,30 +3,36 @@
 
 Reads complex float IQ from stdin (36 kS/s, centered on TETRA carrier).
 Writes PCM audio to stdout (8 kHz, 16-bit signed LE, mono) ONLY during
-active voice frames — stream goes silent when no call is in progress.
+active CLEAR voice calls — stream goes silent when no clear call is in
+progress, and is suppressed for encrypted calls (since we have no SCK).
 Writes JSON metadata to stderr (TETMON signaling: network info, calls).
 
-Debug: TETRA_DEBUG=1 -> dumps to /tmp/tetra-debug.log (override path with
-TETRA_DEBUG_FILE). Banner is written on every start regardless of flag.
+Active-clear-call filter (Bug 12):
+  This build of osmo-tetra-sq5bpf emits voice bursts even for encrypted
+  calls — the codec then produces noise with vocal envelope. To avoid
+  mixing clear and scrambled audio in the same output stream, we only
+  feed the codec when at least one D-SETUP/D-CONNECT with ENCR:0 is
+  active and not yet released. Toggle with TETRA_DROP_NO_CALL=0 to
+  disable filtering (debug only).
 
-PCM capture: TETRA_PCM_DUMP=/path/to/file.raw -> appends every PCM chunk
-emitted to stdout into the file as well. Listen offline with:
-  aplay -r 8000 -f S16_LE -c 1 /path/to/file.raw
-This isolates whether garbled audio comes from the codec output or from
-the OpenWebRX+ post-processing chain (Opus encoder, downsampling).
+Debug:
+  TETRA_DEBUG=1               -> dumps to /tmp/tetra-debug.log (override
+                                 path with TETRA_DEBUG_FILE).
+  TETRA_PCM_DUMP=/path.raw    -> appends each PCM chunk to file. Listen
+                                 with `aplay -r 8000 -f S16_LE -c 1 ...`.
+  TETRA_DROP_NO_CALL=0        -> disable clear-call filter (let codec
+                                 process every voice burst).
 
-Key TETMON format facts (confirmed empirically from osmo-tetra-sq5bpf):
-  - Audio frames (no -e): 'TRA:HH RX:HH DECR:HH ' + 1380 bytes ACELP.
-    Audio frames (with -e): 'TRA:HH RX:HH\x00'   + 1380 bytes (passthrough).
-  - Per-call encryption indicator: 'ENCC:N' on DSETUPDEC/DCONNECTDEC/
-    DTXGRANTDEC PDUs (0=clear, 1=TEA1, 2=TEA2, 3=TEA3).
-  - Cell-level capability: 'CRYPT:N' on NETINFO1/ENCINFO1 (informational).
+Encryption indicator: the short-form FUNCs (D-SETUP, D-CONNECT, D-RELEASE,
+D-TX CEASED) carry an `ENCR:N` field where 0=clear and ≠0=encrypted.
+The long-form FUNCs (DSETUPDEC, DCONNECTDEC, DRELEASEDEC) don't carry
+this field in this build, so we drive the call-state machine from the
+short form only.
 
-We invoke tetra-rx WITHOUT '-e'. The flag emits frames from encrypted
-calls in a passthrough format that bypasses parts of the L2 decode and
-delivers garbled / mis-aligned bytes to the codec. The reference
-mbbrzoza/OpenWebRX-Tetra-Plugin runs without -e and emits frames in
-the standard 3-field format with proper DECR data on clear calls.
+Voice frame format (this build always emits the 2-field NUL-terminated
+header even without `-e`): `TRA:HH RX:HH\\x00<1380 bytes>`. The TRA byte
+is a frame counter, not a burst type discriminator. We can't filter
+voice frames by TRA value.
 
 Codec pipeline is async: feeding ACELP into cdecoder.stdin never blocks
 the main loop. A dedicated reader thread pulls PCM from sdecoder.stdout
@@ -48,15 +54,13 @@ TETRA_DIR = os.environ.get("TETRA_DIR", "/opt/openwebrx-tetra")
 TETRA_DEBUG = os.environ.get("TETRA_DEBUG", "0") == "1"
 TETRA_DEBUG_FILE = os.environ.get("TETRA_DEBUG_FILE", "/tmp/tetra-debug.log")
 TETRA_PCM_DUMP = os.environ.get("TETRA_PCM_DUMP", "")
+TETRA_DROP_NO_CALL = os.environ.get("TETRA_DROP_NO_CALL", "1") == "1"
 
 ACELP_FRAME_SIZE = 1380
 PCM_OUTPUT_BYTES = 960
+CALL_STALE_TIMEOUT = 30.0  # seconds without renewal -> drop SSI
 
-# Unified audio header pattern. Covers both observed formats:
-#   Standard (no -e): 'TRA:HH RX:HH DECR:HH '   3-field, space-terminated
-#   Passthrough (-e): 'TRA:HH RX:HH\x00'        2-field, NUL-terminated
-# We invoke tetra-rx without -e, so we should always hit the standard format.
-# match.end() points exactly at the start of the 1380-byte ACELP payload.
+# Unified audio header pattern.
 AUDIO_PATTERN = re.compile(
     rb"TRA:[0-9a-fA-F]+ +RX:[0-9a-fA-F]+(?: +DECR:[0-9a-fA-F]+ +|\x00)"
 )
@@ -65,10 +69,11 @@ TEA_NAMES = {0: "none", 1: "TEA1", 2: "TEA2", 3: "TEA3"}
 
 try:
     _DEBUG_FH = open(TETRA_DEBUG_FILE, 'a', buffering=1)
-    _DEBUG_FH.write('\n=== tetra_decoder.py startup at {} | TETRA_DEBUG={} | PCM_DUMP={} ===\n'.format(
+    _DEBUG_FH.write('\n=== tetra_decoder.py startup at {} | TETRA_DEBUG={} | PCM_DUMP={} | DROP_NO_CALL={} ===\n'.format(
         datetime.datetime.now().isoformat(timespec='seconds'),
         'on' if TETRA_DEBUG else 'off',
-        TETRA_PCM_DUMP or 'off'))
+        TETRA_PCM_DUMP or 'off',
+        'on' if TETRA_DROP_NO_CALL else 'off'))
 except Exception:
     _DEBUG_FH = None
 
@@ -91,6 +96,58 @@ def debug_dump(label, data, max_bytes=128):
             time.strftime('%H:%M:%S'), label, len(data), hex_str, ascii_str))
     except Exception:
         pass
+
+
+# ---------- Active clear-call tracking ----------
+
+_active_clear_calls = set()
+_last_seen_call = {}
+_calls_lock = threading.Lock()
+
+
+def _mark_clear(ssi):
+    if ssi <= 0:
+        return
+    now = time.monotonic()
+    with _calls_lock:
+        added = ssi not in _active_clear_calls
+        _active_clear_calls.add(ssi)
+        _last_seen_call[ssi] = now
+    if added and TETRA_DEBUG:
+        debug_dump('call_open_clear', f'ssi={ssi}'.encode(), max_bytes=32)
+
+
+def _mark_encrypted(ssi):
+    if ssi <= 0:
+        return
+    with _calls_lock:
+        removed = ssi in _active_clear_calls
+        _active_clear_calls.discard(ssi)
+        _last_seen_call.pop(ssi, None)
+    if removed and TETRA_DEBUG:
+        debug_dump('call_drop_enc', f'ssi={ssi}'.encode(), max_bytes=32)
+
+
+def _mark_release(ssi):
+    if ssi <= 0:
+        return
+    with _calls_lock:
+        removed = ssi in _active_clear_calls
+        _active_clear_calls.discard(ssi)
+        _last_seen_call.pop(ssi, None)
+    if removed and TETRA_DEBUG:
+        debug_dump('call_release', f'ssi={ssi}'.encode(), max_bytes=32)
+
+
+def _has_active_clear_call():
+    now = time.monotonic()
+    with _calls_lock:
+        stale = [s for s, t in _last_seen_call.items()
+                 if now - t > CALL_STALE_TIMEOUT]
+        for s in stale:
+            _active_clear_calls.discard(s)
+            _last_seen_call.pop(s, None)
+        return bool(_active_clear_calls)
 
 
 def parse_tetmon_fields(data):
@@ -205,12 +262,13 @@ def parse_audio_from_udp(data):
     return payload[offset:offset + ACELP_FRAME_SIZE]
 
 
-def _enc_pair(fields):
+def _enc_pair_from_encr(fields):
+    """ENCR:N is the encryption indicator on short-form FUNCs."""
     try:
-        encc = int(fields.get('ENCC', '0'))
+        encr = int(fields.get('ENCR', '0'))
     except ValueError:
-        encc = 0
-    return (encc in (1, 2, 3), TEA_NAMES.get(encc, "none"), encc)
+        encr = 0
+    return (encr in (1, 2, 3), TEA_NAMES.get(encr, "none"), encr)
 
 
 def parse_metadata_from_udp(data):
@@ -227,10 +285,48 @@ def parse_metadata_from_udp(data):
 
     fields = parse_tetmon_fields(payload)
     func = fields.get('FUNC', '')
-    func_match = re.search(rb'FUNC:(\S+(?:\s+(?!SSI:|IDX:|IDT:|ENCR:|ENCC:|RX:|CID:|NID:|CCODE:|MCC:|MNC:|TXGRANT:|TXPERM:)\S+)*)', payload)
+    func_match = re.search(
+        rb'FUNC:(\S+(?:\s+(?!SSI:|SSI2:|IDX:|IDT:|ENCR:|ENCC:|RX:|CID:|NID:|CCODE:|MCC:|MNC:|TXGRANT:|TXPERM:|CALLOWN:|STATUS:|DLF:|ULF:|LA:|CRYPT:|ENC:|TIME:)\S+)*)',
+        payload)
     if func_match:
         func = func_match.group(1).decode()
 
+    try: ssi = int(fields.get('SSI', '0'))
+    except ValueError: ssi = 0
+
+    # ----- Short-form FUNCs (drive call-state machine via ENCR) -----
+    if func == 'D-SETUP':
+        enc, enc_type, encr = _enc_pair_from_encr(fields)
+        if encr == 0:
+            _mark_clear(ssi)
+        else:
+            _mark_encrypted(ssi)
+        return {"protocol": "TETRA", "type": "call_setup",
+                "ssi": ssi, "encr": encr, "encrypted": enc,
+                "encryption_type": enc_type}
+
+    if func == 'D-CONNECT':
+        enc, enc_type, encr = _enc_pair_from_encr(fields)
+        if encr == 0:
+            _mark_clear(ssi)
+        else:
+            _mark_encrypted(ssi)
+        return {"protocol": "TETRA", "type": "call_connect",
+                "ssi": ssi, "encr": encr, "encrypted": enc,
+                "encryption_type": enc_type}
+
+    if func == 'D-RELEASE':
+        _mark_release(ssi)
+        return {"protocol": "TETRA", "type": "call_release", "ssi": ssi}
+
+    if func.startswith('D-TX'):
+        # 'D-TX CEASED' marks end of TX for that SSI -> drop from active set.
+        if 'CEASED' in func:
+            _mark_release(ssi)
+        return {"protocol": "TETRA", "type": "tx",
+                "ssi": ssi, "func": func}
+
+    # ----- Long-form FUNCs (additional fields, no ENCR) -----
     if func == 'NETINFO1':
         try: mcc = int(fields.get('MCC', '0'), 16)
         except ValueError: mcc = 0
@@ -257,37 +353,33 @@ def parse_metadata_from_udp(data):
                 "ul_freq": int(fields.get('ULF', '0'))}
 
     if func == 'DSETUPDEC':
-        enc, enc_type, encc = _enc_pair(fields)
-        return {"protocol": "TETRA", "type": "call_setup",
-                "ssi": int(fields.get('SSI', '0')),
+        # No ENCR field here; the short D-SETUP decides clear/enc.
+        return {"protocol": "TETRA", "type": "call_setup_detail",
+                "ssi": ssi,
                 "ssi2": int(fields.get('SSI2', '0')),
                 "call_id": int(fields.get('CID', '0')),
-                "idx": int(fields.get('IDX', '0')),
-                "encc": encc, "encrypted": enc, "encryption_type": enc_type}
+                "idx": int(fields.get('IDX', '0'))}
 
-    if func in ('DRELEASEDEC', 'D-RELEASE'):
+    if func == 'DRELEASEDEC':
+        _mark_release(ssi)
         return {"protocol": "TETRA", "type": "call_release",
-                "ssi": int(fields.get('SSI', '0')),
+                "ssi": ssi,
                 "call_id": int(fields.get('CID', '0'))}
 
     if func == 'DCONNECTDEC':
-        enc, enc_type, encc = _enc_pair(fields)
-        result = {"protocol": "TETRA", "type": "call_connect",
-                  "ssi": int(fields.get('SSI', '0')),
+        result = {"protocol": "TETRA", "type": "call_connect_detail",
+                  "ssi": ssi,
                   "call_id": int(fields.get('CID', '0')),
-                  "idx": int(fields.get('IDX', '0')),
-                  "encc": encc, "encrypted": enc, "encryption_type": enc_type}
+                  "idx": int(fields.get('IDX', '0'))}
         if 'SSI2' in fields:
             result["ssi2"] = int(fields['SSI2'])
         return result
 
     if func == 'DTXGRANTDEC':
-        enc, enc_type, encc = _enc_pair(fields)
         result = {"protocol": "TETRA", "type": "tx_grant",
-                  "ssi": int(fields.get('SSI', '0')),
+                  "ssi": ssi,
                   "call_id": int(fields.get('CID', '0')),
-                  "idx": int(fields.get('IDX', '0')),
-                  "encc": encc, "encrypted": enc, "encryption_type": enc_type}
+                  "idx": int(fields.get('IDX', '0'))}
         if 'SSI2' in fields:
             result["ssi2"] = int(fields['SSI2'])
         return result
@@ -302,7 +394,7 @@ def parse_metadata_from_udp(data):
 
     if func == 'DSTATUSDEC':
         return {"protocol": "TETRA", "type": "status",
-                "ssi": int(fields.get('SSI', '0')),
+                "ssi": ssi,
                 "ssi2": int(fields.get('SSI2', '0')),
                 "status": fields.get('STATUS', '')}
 
@@ -311,11 +403,10 @@ def parse_metadata_from_udp(data):
 
     if func == 'SDSDEC':
         return {"protocol": "TETRA", "type": "sds",
-                "ssi": int(fields.get('SSI', '0')),
+                "ssi": ssi,
                 "ssi2": int(fields.get('SSI2', '0'))}
 
     if func.startswith('D-') and 'IDT' in fields:
-        ssi = int(fields.get('SSI', '0'))
         ssi2 = int(fields.get('SSI2', '0')) if 'SSI2' in fields else 0
         if ssi > 0 or ssi2 > 0:
             result = {"protocol": "TETRA", "type": "resource",
@@ -356,9 +447,6 @@ def main():
 
     demod = subprocess.Popen(['python3', demod_path], stdin=0,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
-    # Match the reference plugin (mbbrzoza/OpenWebRX-Tetra-Plugin) flags.
-    # Do NOT add '-e': it puts tetra-rx in encrypted-passthrough mode and
-    # breaks the audio frame format.
     tetra_rx_cmd = [tetra_rx_path, '-r', '-s', '/dev/stdin']
     if os.path.isfile(keyfile):
         tetra_rx_cmd.extend(['-k', keyfile])
@@ -375,6 +463,9 @@ def main():
     burst_rate = [0.0]
     burst_window_start = [time.monotonic()]
     call_type_info = [""]
+    drop_count = [0]
+    fed_count = [0]
+    last_drop_log = [time.monotonic()]
 
     re_sync = re.compile(r'TN \d+\((\d+)\)')
     re_access_dl = re.compile(r'DL_USAGE:\s*(\S+)')
@@ -477,7 +568,8 @@ def main():
                         if call_type_info[0]:
                             meta["call_type"] = call_type_info[0]
 
-                if msg_type in ("call_setup", "call_connect", "tx_grant"):
+                if msg_type in ("call_setup", "call_connect", "call_setup_detail",
+                                "call_connect_detail", "tx_grant", "tx"):
                     with state_lock:
                         if call_type_info[0]:
                             meta["call_type"] = call_type_info[0]
@@ -492,7 +584,17 @@ def main():
         acelp_data = parse_audio_from_udp(data)
         if acelp_data is not None:
             debug_dump('acelp', acelp_data, max_bytes=32)
-            codec.feed(acelp_data)
+            if TETRA_DROP_NO_CALL and not _has_active_clear_call():
+                drop_count[0] += 1
+            else:
+                fed_count[0] += 1
+                codec.feed(acelp_data)
+            now = time.monotonic()
+            if TETRA_DEBUG and now - last_drop_log[0] >= 5.0:
+                debug_dump('frame_stats',
+                           f'fed={fed_count[0]} dropped={drop_count[0]} active_clear={len(_active_clear_calls)}'.encode(),
+                           max_bytes=64)
+                last_drop_log[0] = now
 
     sock.close()
     codec.stop()
