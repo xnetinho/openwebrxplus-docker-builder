@@ -1,7 +1,7 @@
 # TETRA Frequency Monitoring Branch — Status & Roadmap
 
 Branch: `claude/tetra-frequency-monitoring-3IqM9`
-Last updated: 2026-04-30 (session 3)
+Last updated: 2026-05-01 (session 5)
 
 Purpose: fix the TETRA decoder pipeline so the OpenWebRX+ panel matches
 reality and unencrypted voice traffic plays back as audio.
@@ -55,16 +55,19 @@ Reverted to the bundled (11-year-old) codec.diff which decodes plain
 ACELP without keystream interpretation. Correct behavior when no SCK
 is loaded.
 
-### Bug 5 — Basicinfo low-nibble misread as encryption_mode (FIXED — `b47abd1`)
+### Bug 5 — Basicinfo low-nibble misread as encryption_mode (FIXED — `b47abd1`, then SUPERSEDED)
 
 The original code interpreted `Basicinfo:0xXY` as packed
-`call_type:encryption_mode`, parsing the low nibble as TEAn. Empirical
-data from the user's `tetra-debug.log` capture showed this is wrong;
-the authoritative per-call encryption comes from a different field.
+`call_type:encryption_mode`, parsing the low nibble as TEAn.
 
-Fixed: extract `ENCC:N` from `DSETUPDEC` / `DCONNECTDEC` /
-`DTXGRANTDEC` PDUs. Basicinfo is now used only for the call_type label
-(high bits), without an appended TEAn suffix.
+First fix attempted `ENCC:N` from `DSETUPDEC` / `DCONNECTDEC` /
+`DTXGRANTDEC` PDUs. **This was wrong**: log v3 analysis (session 4)
+revealed that this build does NOT emit `ENCC:` at all. The actual
+per-call encryption indicator is `ENCR:N` and it appears only on the
+short-form FUNCs (`D-SETUP`, `D-CONNECT`, `D-RELEASE`, `D-TX`).
+
+Superseded by Bug 12 attempt (commit `f0ed4d2`), which moved the
+encryption parse to `ENCR` on short-form FUNCs.
 
 ### Bug 6 — Audio frame regex never matched (FIXED — `b47abd1`)
 
@@ -141,57 +144,107 @@ overridable via `TETRA_DEBUG_FILE`). Line-buffered append. Always
 writes a startup banner regardless of TETRA_DEBUG, so users can
 verify the new code is actually running.
 
-### Bug 11 — Audio still mixed clear+scrambled after all fixes (OPEN — diagnostic step `6ff2e36`)
+### Bug 11 — Codec output itself is mixed clear+scrambled (CONFIRMED IN PIPELINE — `6ff2e36`)
 
-Even after applying every fix above, on a cell reported as `Cell Sec.:
-TEA2 / Encryption: Clear` (391.525), the user still hears intelligible
-speech mixed with scrambled segments. PCM IS being produced (~251
-chunks of 960 bytes per debug dump), the input ACELP stream looks
-uniform (`TRA:39`, first byte `0x21` consistently), and yet the output
-is partly garbled. Observed PCM emission rate ≈ 50% of real-time, hinting
-at frame loss or rate mismatch somewhere in the chain.
+Even after every fix above, on a TEA2-capable cell (391.525 MHz)
+with a clear call active, the user hears intelligible speech
+intermixed with scrambled segments.
 
-Hypotheses still on the table:
-1. Codec input-format mismatch (cdecoder may expect bit-soft-decision
-   int16 per bit, not packed bytes).
-2. OWRX+ post-processing chain (Opus encoder, resampler) introduces
-   the artefacts AFTER our decoder writes clean PCM.
-3. osmo-tetra-sq5bpf upstream is delivering frames that are partially
-   from encrypted bursts even though ENCC=0.
+Diagnostic step (`6ff2e36`): added `TETRA_PCM_DUMP=/path.raw` env var
+so every PCM chunk emitted by the codec is also appended to a raw
+file. User listened with `aplay -r 8000 -f S16_LE -c 1 ...` and in
+Audacity (Signed 16-bit PCM, LE, mono, 8 kHz).
 
-**Diagnostic step (commit `6ff2e36`):** added `TETRA_PCM_DUMP` env var
-to `tetra_decoder.py`. When set, every PCM chunk emitted to stdout is
-also appended to the given file. This isolates the codec output from
-the OpenWebRX+ post-processing chain.
+**Result confirmed by user (session 4)**: the offline `.raw` is
+*identical* to what the browser plays — clear voice mixed with
+scrambled segments. This **rules out** the OWRX+ post-processing
+chain (Opus encoder, resampler, WebSocket). The artefact is in our
+pipeline OR in osmo-tetra-sq5bpf upstream.
 
-User instructions:
+User narrative reinforces the diagnosis: hears one operator clearly,
+then the base-station response on the same TS comes back scrambled,
+and subsequent QSOs (the operator's replies) remain scrambled. Strong
+match with TEA2-encrypted calls being decoded as garbled ACELP — i.e.
+osmo-tetra-sq5bpf is emitting voice bursts even for encrypted calls
+on this build, and we feed them to the codec indiscriminately.
 
-```sh
-# 1. Pull the latest image with the new env support
-docker pull <image>
+### Bug 12 — Active-clear-call filter (ATTEMPTED, FAILED — `f0ed4d2`)
 
-# 2. Add to your container env (Portainer / docker-compose):
-TETRA_DEBUG=1
-TETRA_DEBUG_FILE=/tmp/tetra-debug.log
-TETRA_PCM_DUMP=/tmp/tetra-pcm.raw
+Hypothesis: gate codec input on a per-SSI clear-call state machine
+driven by short-form FUNC ENCR field. Track:
 
-# 3. Tune to the test frequency, let a clear call play for ~30 s.
+  - `D-SETUP` / `D-CONNECT` with `ENCR:0`  → mark SSI clear.
+  - `D-SETUP` / `D-CONNECT` with `ENCR:1/2/3` → drop SSI from clear set.
+  - `D-RELEASE` or `D-TX CEASED` → drop SSI from clear set.
+  - 30 s stale timeout per SSI.
 
-# 4. Copy the file out:
-docker cp <container>:/tmp/tetra-pcm.raw .
+Drop ACELP frames if no SSI is currently in the clear set
+(`TETRA_DROP_NO_CALL=1`, default; set to `0` to disable filter).
 
-# 5. Listen offline:
-aplay -r 8000 -f S16_LE -c 1 tetra-pcm.raw
+**Result: total silence.** Log v4 (403 MB capture, session 5):
+
+```
+grep -E 'call_open_clear|call_release|call_drop_enc' tetra-debug.log
+   | wc -l                                        →  0
+grep 'frame_stats' tetra-debug.log | tail -1
+   →  fed=0 dropped=20278 active_clear=0
+grep -oE 'ENCR:[0-9]+' tetra-debug.log | wc -l   →  0
 ```
 
-Decision tree from the result:
-  - **PCM is intelligible offline (clean voice in `aplay`)**: the codec
-    is correct; the artefact is introduced by OWRX+'s Opus encoder /
-    resampler / WebSocket chain. Fix moves to `csdr_module_tetra.py`
-    or the audio output stage.
-  - **PCM is also scrambled offline**: the artefact is in our pipeline.
-    Look at codec input format (try bit-unpack), frame timing, or
-    osmo-tetra-sq5bpf upstream behavior on TEA2-capable cells.
+100% of the 20 278 voice frames were dropped because zero short-form
+FUNCs were emitted during the entire 3+ minute capture (zero `ENCR:`
+occurrences). The state machine never received a single transition.
+
+For comparison, log v3 (session 4) had 79 `ENCR:0` events, all from
+short-form FUNCs, so the parsing path itself works — but those events
+are emitted only sporadically by `tetra-rx` while voice bursts flow
+continuously, and on log v4 they never appeared.
+
+Conclusion: **the gate-by-ENCR strategy is unworkable** on this
+build. Filter remains in code (gated by `TETRA_DROP_NO_CALL`, default
+ON) but is effectively unusable until replaced — user must set
+`TETRA_DROP_NO_CALL=0` to get audio at all.
+
+### Bug 13 — Need a frame-level encryption indicator (OPEN — analysis complete)
+
+To fix Bug 11 we need to drop encrypted ACELP bursts on a per-frame
+basis (signaling cannot be the source of truth — see Bug 12).
+
+**Upstream investigation (session 5)**: read
+`sq5bpf/osmo-tetra-sq5bpf-2/src/lower_mac/tetra_lower_mac.c` via
+WebFetch. The voice-frame passthrough is:
+
+```c
+sprintf(tmpstr,"TRA:%2.2x RX:%2.2x DECR:%i\0",
+        tms->cur_burst.is_traffic, tetra_hack_rxid, decrypted);
+```
+
+  - `TRA:` = `is_traffic` (boolean upstream; the 0x19/0x1d/0x21 etc.
+    values we observed in the log are likely artefacts of adjacent
+    `block` memory bleeding into the format buffer, not a counter).
+  - `RX:`  = fixed `tetra_hack_rxid`.
+  - `DECR:` = `decrypted` flag — set to `1` only if
+    `get_voice_keystream()` succeeded; `0` otherwise.
+
+Crucially, `decrypted=0` is emitted both for **clear** bursts (no
+keystream needed) and for **encrypted bursts we couldn't decrypt**
+(no key loaded). They are indistinguishable in the passthrough header.
+
+A grep of the upstream source confirmed: **no other variable**
+(`encrypted_burst`, `encr_burst`, `kss_failed`, `encryption_used`, …)
+exists that flags "this burst was encrypted regardless of decryption
+outcome". The header carries `DECR` only.
+
+Implication: for a TEA2/TEA3 cell **without keys**, no header-based
+filter can separate clear from encrypted. Three remaining paths:
+
+| Option | Approach | Risk / cost |
+|---|---|---|
+| A | Statistical detection on the 1380-byte ACELP payload (entropy / χ² — encrypted is near-uniform, clear has structure). Gate codec.feed() per frame. | Medium. ~80 LOC Python; needs calibration with the existing PCM dump. Risk of false positives on silence/whisper bursts. |
+| B | Patch upstream `tetra_lower_mac.c` to read the MAC PDU encryption-mode bit and emit a real `ENC:N` field in the passthrough header. | High. Modify C, rebuild osmo-tetra in the Docker image. Authoritative result. |
+| C | Accept mixed audio. Set `TETRA_DROP_NO_CALL=0` and document the limitation. | Zero cost. No real fix. |
+
+Decision pending — user to choose A, B, or C.
 
 ---
 
@@ -207,11 +260,12 @@ Decision tree from the result:
 | `cfd357e` | `docs/tetra-fix-status.md` | Initial status doc |
 | `365ec98` | `tetra_decoder.py` | Remove silence_20ms padding; match DMR behavior |
 | `00c45c2` | `tetra_decoder.py` | Debug dump to file instead of stderr |
-| `b47abd1` | `tetra_decoder.py` | Unified AUDIO_PATTERN; ENCC for per-call encryption |
+| `b47abd1` | `tetra_decoder.py` | Unified AUDIO_PATTERN; ENCC for per-call encryption (later wrong) |
 | `52d8833` | `tetra_decoder.py` | Async codec pipeline (reader thread) |
 | `b5e19e8` | `build-tetra-packages.sh` | Revert codec.diff to bundled patch |
 | `fec8ff9` | `tetra_decoder.py` | Drop `-e` flag from tetra-rx (passthrough corruption) |
 | `6ff2e36` | `tetra_decoder.py` | Add TETRA_PCM_DUMP env for offline `aplay` diagnosis |
+| `f0ed4d2` | `tetra_decoder.py` | Active-clear-call filter via short-form FUNC ENCR (Bug 12 — failed) |
 
 ---
 
@@ -225,10 +279,13 @@ netinfo      mcc, mnc, dl_freq, ul_freq, color_code,
              encrypted=false, encryption_type="none", la
 freqinfo     dl_freq, ul_freq
 encinfo      cell_security_class, cell_tea, enc_mode, encrypted=false
-call_setup   ssi, ssi2, call_id, idx, encc, encrypted, encryption_type, call_type
-call_connect ssi, ssi2, call_id, idx, encc, encrypted, encryption_type, call_type
-tx_grant     ssi, ssi2, call_id, idx, encc, encrypted, encryption_type, call_type
-call_release ssi, call_id
+call_setup        ssi, encr, encrypted, encryption_type, call_type    (D-SETUP)
+call_connect      ssi, encr, encrypted, encryption_type, call_type    (D-CONNECT)
+call_setup_detail   ssi, ssi2, call_id, idx                           (DSETUPDEC)
+call_connect_detail ssi, ssi2?, call_id, idx                          (DCONNECTDEC)
+call_release ssi, call_id?
+tx           ssi, func                                                (D-TX*)
+tx_grant     ssi, ssi2?, call_id, idx                                 (DTXGRANTDEC)
 status       ssi, ssi2, status
 sds          ssi, ssi2
 burst        timeslots{}, afc, burst_rate, call_type
@@ -246,27 +303,34 @@ resource     func, ssi, idt, ssi2?
 | 0 ACELP frames extracted | -> ACELP extraction working | YES (in dump after `b47abd1`) |
 | Panel freezes on first ACELP | -> panel keeps updating | YES (`52d8833`) |
 | Periodic 300ms-intelligible voice | -> still mixed clear+scrambled | NO — see Bug 11 |
-| TEA1 false positive on clear calls | -> ENCC-derived encryption | YES (`b47abd1`) |
+| TEA1 false positive on clear calls | -> ENCC-derived encryption | superseded — ENCC doesn't exist on this build |
+| Mixed clear+scrambled audio in browser | -> still mixed offline (`.raw` confirms) | confirmed in pipeline (Bug 11) |
+| `TETRA_DROP_NO_CALL=1` filters encrypted | -> total silence (Bug 12) | filter unusable on this build |
 
 ---
 
 ## Open work
 
-### Bug 11 PCM-dump diagnosis (next user-side step)
+### Bug 13 — Pick A / B / C (next decision point)
 
-See Bug 11 above. After the user listens to `tetra-pcm.raw` offline with
-`aplay`, the next code change goes either into the decoder pipeline or
-into OWRX+'s audio output chain. Holding all other work until that
-result.
+Source-of-truth investigation is done. The header passthrough has no
+"this burst was encrypted" flag. User to pick:
+
+- **A** statistical: probably-fast, may have false positives.
+- **B** upstream patch: probably-correct, more invasive.
+- **C** accept mixed audio: no work, no fix.
+
+Workaround in the meantime: `TETRA_DROP_NO_CALL=0` to disable the
+useless-on-this-build filter and revert to mixed audio.
 
 ### Frontend: SCK-locked badge state
 
 When `cell_security_class > 0` AND no keyfile is loaded, the panel
-currently shows green 'Clear' (correct per ENCC=0 semantics, but
+currently shows green 'Clear' (correct per ENCR=0 semantics, but
 misleading because the call is wrapped in air-interface encryption
 the user can't decode). Proposed visual:
 
-| Cell SC | ENCC | Badge | Color |
+| Cell SC | ENCR | Badge | Color |
 |---|---|---|---|
 | 0 | 0 | Clear | green |
 | 0 | 1/2/3 | TEAn (active) | red |
@@ -308,11 +372,23 @@ diffs found:
 | Codec call style | synchronous | async via reader thread |
 | Silence padding | yes (legacy) | removed (`365ec98`) |
 | Debug dumps | none | TETRA_DEBUG=1 -> file |
-| Encryption source | Basicinfo low nibble | ENCC field |
+| Encryption source | Basicinfo low nibble | ENCR (short-form FUNC) |
 | Cell-cap vs call-enc | merged | separated (`Cell Sec.` row) |
+| Mixed clear/encrypted audio on TEA2 cell | same problem (untested) | same problem — see Bug 11/13 |
 
 The reference does not split cell-capability from active-call encryption,
-nor does it use the ENCC field. Our improvements there go beyond what
-the reference does. The audio pipeline differences after our fixes are
-functionally equivalent on clear cells; ours is more resilient on
-encrypted cells (no deadlock, lower kbps when idle).
+nor does it use ENCR-driven gating. Our improvements there go beyond
+what the reference does. The audio pipeline differences after our
+fixes are functionally equivalent on clear-only cells; the open
+issue (Bug 11/13) likely affects the reference plugin too on
+TEA2-capable cells.
+
+---
+
+## Session log (high-level)
+
+- **Session 1**: Bugs 1, 2, 3 identified and fixed; codec.diff swap (later reverted as Bug 4).
+- **Session 2**: Bugs 5, 6, 7, 9, 10 fixed; reference plugin comparison; async codec pipeline; ENCC parsing introduced (later proven wrong).
+- **Session 3**: Bug 8 (`-e` flag) fixed; PCM-dump diagnostic step added (Bug 11 isolation).
+- **Session 4**: User confirmed offline `.raw` is identical to browser audio → artefact is in pipeline (not OWRX+ chain). Log v3 analysis: ENCC absent, ENCR present (79 events all `ENCR:0`); voice frames precede first short-form FUNC by 125 frames. Active-clear-call filter implemented (Bug 12, commit `f0ed4d2`).
+- **Session 5**: Log v4 analysis: 0 ENCR fields in 403 MB capture, 100% frame drop, total silence — Bug 12 unusable. WebFetch on upstream `osmo-tetra-sq5bpf-2` confirms no encryption flag exists in passthrough header beyond `DECR` (which is decryption-success, not encryption-detected). Bug 13 opened with three options (A statistical / B upstream patch / C accept). Pending user decision.
