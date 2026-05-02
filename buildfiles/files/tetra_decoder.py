@@ -2,37 +2,44 @@
 """TETRA decoder wrapper for OpenWebRX+.
 
 Reads complex float IQ from stdin (36 kS/s, centered on TETRA carrier).
-Writes PCM audio to stdout (8 kHz, 16-bit signed LE, mono) ONLY during
-active CLEAR voice calls — stream goes silent when no clear call is in
-progress, and is suppressed for encrypted calls (since we have no SCK).
+Writes PCM audio to stdout (8 kHz, 16-bit signed LE, mono).
 Writes JSON metadata to stderr (TETMON signaling: network info, calls).
 
-Active-clear-call filter (Bug 12):
+Per-frame encryption filtering (Bug 13, Option A):
   This build of osmo-tetra-sq5bpf emits voice bursts even for encrypted
-  calls — the codec then produces noise with vocal envelope. To avoid
-  mixing clear and scrambled audio in the same output stream, we only
-  feed the codec when at least one D-SETUP/D-CONNECT with ENCR:0 is
-  active and not yet released. Toggle with TETRA_DROP_NO_CALL=0 to
-  disable filtering (debug only).
+  calls — the codec then produces noise with vocal envelope. We use a
+  zlib compression-ratio heuristic on each ACELP payload to drop
+  bursts that look uniform-random (likely encrypted). Threshold via
+  `TETRA_ENC_RATIO_THRESHOLD` (float, default 0 = filter off pending
+  calibration). Per-frame ratios are logged when `TETRA_DEBUG=1` so
+  the user can pick a threshold from a real capture.
+
+  The earlier signaling-based filter (Bug 12) is preserved but
+  defaults to off (`TETRA_DROP_NO_CALL=0`) because short-form FUNC
+  emission is too sparse on this build to be a reliable gate.
 
 Debug:
-  TETRA_DEBUG=1               -> dumps to /tmp/tetra-debug.log (override
-                                 path with TETRA_DEBUG_FILE).
-  TETRA_PCM_DUMP=/path.raw    -> appends each PCM chunk to file. Listen
-                                 with `aplay -r 8000 -f S16_LE -c 1 ...`.
-  TETRA_DROP_NO_CALL=0        -> disable clear-call filter (let codec
-                                 process every voice burst).
+  TETRA_DEBUG=1                  -> dumps to /tmp/tetra-debug.log
+                                    (override path with TETRA_DEBUG_FILE).
+  TETRA_PCM_DUMP=/path.raw       -> appends each PCM chunk to file.
+                                    Listen with `aplay -r 8000 -f S16_LE
+                                    -c 1 ...`.
+  TETRA_ENC_RATIO_THRESHOLD=0.92 -> drop bursts with zlib ratio above
+                                    this value (Option A filter; 0 = off).
+  TETRA_DROP_NO_CALL=1           -> legacy clear-call filter (default
+                                    off, unusable on this build).
 
-Encryption indicator: the short-form FUNCs (D-SETUP, D-CONNECT, D-RELEASE,
+Encryption indicator: short-form FUNCs (D-SETUP, D-CONNECT, D-RELEASE,
 D-TX CEASED) carry an `ENCR:N` field where 0=clear and ≠0=encrypted.
 The long-form FUNCs (DSETUPDEC, DCONNECTDEC, DRELEASEDEC) don't carry
-this field in this build, so we drive the call-state machine from the
-short form only.
+this field in this build, so we drive the legacy call-state machine
+from the short form only.
 
 Voice frame format (this build always emits the 2-field NUL-terminated
-header even without `-e`): `TRA:HH RX:HH\\x00<1380 bytes>`. The TRA byte
-is a frame counter, not a burst type discriminator. We can't filter
-voice frames by TRA value.
+header even without `-e`): `TRA:HH RX:HH\\x00` + 1380 bytes (690 × int16
+soft-bits, first word `0x6B21` little-endian, ±127 magnitudes after
+Viterbi). The TRA byte is unstable upstream; do not use it as a burst
+type discriminator.
 
 Codec pipeline is async: feeding ACELP into cdecoder.stdin never blocks
 the main loop. A dedicated reader thread pulls PCM from sdecoder.stdout
@@ -49,12 +56,18 @@ import subprocess
 import sys
 import threading
 import time
+import zlib
 
 TETRA_DIR = os.environ.get("TETRA_DIR", "/opt/openwebrx-tetra")
 TETRA_DEBUG = os.environ.get("TETRA_DEBUG", "0") == "1"
 TETRA_DEBUG_FILE = os.environ.get("TETRA_DEBUG_FILE", "/tmp/tetra-debug.log")
 TETRA_PCM_DUMP = os.environ.get("TETRA_PCM_DUMP", "")
-TETRA_DROP_NO_CALL = os.environ.get("TETRA_DROP_NO_CALL", "1") == "1"
+TETRA_DROP_NO_CALL = os.environ.get("TETRA_DROP_NO_CALL", "0") == "1"
+try:
+    TETRA_ENC_RATIO_THRESHOLD = float(os.environ.get("TETRA_ENC_RATIO_THRESHOLD", "0"))
+except ValueError:
+    TETRA_ENC_RATIO_THRESHOLD = 0.0
+TETRA_ENC_RATIO_LOG_EVERY = 25  # log enc_ratio every Nth voice frame
 
 ACELP_FRAME_SIZE = 1380
 PCM_OUTPUT_BYTES = 960
@@ -69,11 +82,14 @@ TEA_NAMES = {0: "none", 1: "TEA1", 2: "TEA2", 3: "TEA3"}
 
 try:
     _DEBUG_FH = open(TETRA_DEBUG_FILE, 'a', buffering=1)
-    _DEBUG_FH.write('\n=== tetra_decoder.py startup at {} | TETRA_DEBUG={} | PCM_DUMP={} | DROP_NO_CALL={} ===\n'.format(
-        datetime.datetime.now().isoformat(timespec='seconds'),
-        'on' if TETRA_DEBUG else 'off',
-        TETRA_PCM_DUMP or 'off',
-        'on' if TETRA_DROP_NO_CALL else 'off'))
+    _DEBUG_FH.write(
+        '\n=== tetra_decoder.py startup at {} | TETRA_DEBUG={} | PCM_DUMP={} | '
+        'DROP_NO_CALL={} | ENC_RATIO_THRESHOLD={} ===\n'.format(
+            datetime.datetime.now().isoformat(timespec='seconds'),
+            'on' if TETRA_DEBUG else 'off',
+            TETRA_PCM_DUMP or 'off',
+            'on' if TETRA_DROP_NO_CALL else 'off',
+            TETRA_ENC_RATIO_THRESHOLD if TETRA_ENC_RATIO_THRESHOLD > 0 else 'off'))
 except Exception:
     _DEBUG_FH = None
 
@@ -98,7 +114,25 @@ def debug_dump(label, data, max_bytes=128):
         pass
 
 
-# ---------- Active clear-call tracking ----------
+# ---------- Encryption-ratio heuristic (Bug 13, Option A) ----------
+
+def _enc_ratio(acelp_data):
+    """zlib compression ratio of an ACELP voice frame.
+
+    Clear bursts: speech-correlated sign patterns, ratio low (~0.5–0.85).
+    Encrypted bursts: near-uniform random signs, ratio high (~0.9–1.0).
+
+    Returns 1.0 (== "treat as encrypted") for empty/short input.
+    """
+    if not acelp_data or len(acelp_data) < 32:
+        return 1.0
+    try:
+        return len(zlib.compress(acelp_data, 6)) / len(acelp_data)
+    except Exception:
+        return 1.0
+
+
+# ---------- Active clear-call tracking (legacy Bug 12, default off) ----------
 
 _active_clear_calls = set()
 _last_seen_call = {}
@@ -294,7 +328,7 @@ def parse_metadata_from_udp(data):
     try: ssi = int(fields.get('SSI', '0'))
     except ValueError: ssi = 0
 
-    # ----- Short-form FUNCs (drive call-state machine via ENCR) -----
+    # ----- Short-form FUNCs (drive legacy call-state machine via ENCR) -----
     if func == 'D-SETUP':
         enc, enc_type, encr = _enc_pair_from_encr(fields)
         if encr == 0:
@@ -464,7 +498,10 @@ def main():
     burst_window_start = [time.monotonic()]
     call_type_info = [""]
     drop_count = [0]
+    drop_no_call_count = [0]
+    drop_enc_count = [0]
     fed_count = [0]
+    enc_frame_index = [0]
     last_drop_log = [time.monotonic()]
 
     re_sync = re.compile(r'TN \d+\((\d+)\)')
@@ -584,16 +621,44 @@ def main():
         acelp_data = parse_audio_from_udp(data)
         if acelp_data is not None:
             debug_dump('acelp', acelp_data, max_bytes=32)
-            if TETRA_DROP_NO_CALL and not _has_active_clear_call():
+            enc_frame_index[0] += 1
+
+            ratio = _enc_ratio(acelp_data)
+            ratio_says_drop = (
+                TETRA_ENC_RATIO_THRESHOLD > 0 and ratio > TETRA_ENC_RATIO_THRESHOLD)
+            no_call_says_drop = (
+                TETRA_DROP_NO_CALL and not _has_active_clear_call())
+
+            if TETRA_DEBUG and (enc_frame_index[0] % TETRA_ENC_RATIO_LOG_EVERY) == 0:
+                debug_dump(
+                    'enc_ratio',
+                    ('frame={} ratio={:.3f} threshold={:.3f} drop_ratio={} '
+                     'drop_no_call={}').format(
+                        enc_frame_index[0], ratio, TETRA_ENC_RATIO_THRESHOLD,
+                        int(ratio_says_drop), int(no_call_says_drop)
+                    ).encode(),
+                    max_bytes=128)
+
+            if ratio_says_drop:
+                drop_enc_count[0] += 1
+                drop_count[0] += 1
+            elif no_call_says_drop:
+                drop_no_call_count[0] += 1
                 drop_count[0] += 1
             else:
                 fed_count[0] += 1
                 codec.feed(acelp_data)
+
             now = time.monotonic()
             if TETRA_DEBUG and now - last_drop_log[0] >= 5.0:
-                debug_dump('frame_stats',
-                           f'fed={fed_count[0]} dropped={drop_count[0]} active_clear={len(_active_clear_calls)}'.encode(),
-                           max_bytes=64)
+                debug_dump(
+                    'frame_stats',
+                    ('fed={} dropped={} drop_enc={} drop_no_call={} '
+                     'active_clear={}').format(
+                        fed_count[0], drop_count[0], drop_enc_count[0],
+                        drop_no_call_count[0], len(_active_clear_calls)
+                    ).encode(),
+                    max_bytes=96)
                 last_drop_log[0] = now
 
     sock.close()
