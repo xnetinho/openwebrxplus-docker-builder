@@ -9,14 +9,24 @@ Per-frame encryption filtering (Bug 13, Option A):
   This build of osmo-tetra-sq5bpf emits voice bursts even for encrypted
   calls — the codec then produces noise with vocal envelope. We use a
   zlib compression-ratio heuristic on each ACELP payload to drop
-  bursts that look uniform-random (likely encrypted). Threshold via
-  `TETRA_ENC_RATIO_THRESHOLD` (float, default 0 = filter off pending
-  calibration). Per-frame ratios are logged when `TETRA_DEBUG=1` so
-  the user can pick a threshold from a real capture.
+  bursts that look uniform-random (likely encrypted).
+
+  The 1380-byte ACELP frame is 690 × int16 soft-bits at ±127 magnitudes
+  after Viterbi. The whole frame is dominated by 4 byte values
+  (0x7F/0x81/0x00/0xFF) regardless of clear vs encrypted, so zlib on
+  the full frame gives the same ratio for both classes (~0.11). The
+  discriminating signal lives in the SIGN PATTERN of the soft-bits:
+  speech has correlated signs, encrypted is near-uniform random. We
+  therefore compute the zlib ratio over the high byte of each int16
+  (= the sign indicator).
+
+  Threshold via `TETRA_ENC_RATIO_THRESHOLD` (float, default 0 = filter
+  off pending calibration). When `TETRA_DEBUG=1`, every Nth frame's
+  ratios are logged so the user can pick a threshold from a real
+  capture containing both clear and scrambled bursts.
 
   The earlier signaling-based filter (Bug 12) is preserved but
-  defaults to off (`TETRA_DROP_NO_CALL=0`) because short-form FUNC
-  emission is too sparse on this build to be a reliable gate.
+  defaults to off (`TETRA_DROP_NO_CALL=0`).
 
 Debug:
   TETRA_DEBUG=1                  -> dumps to /tmp/tetra-debug.log
@@ -24,10 +34,11 @@ Debug:
   TETRA_PCM_DUMP=/path.raw       -> appends each PCM chunk to file.
                                     Listen with `aplay -r 8000 -f S16_LE
                                     -c 1 ...`.
-  TETRA_ENC_RATIO_THRESHOLD=0.92 -> drop bursts with zlib ratio above
-                                    this value (Option A filter; 0 = off).
+  TETRA_ENC_RATIO_THRESHOLD=0.85 -> drop bursts with sign-zlib ratio
+                                    above this value (Option A filter;
+                                    0 = off).
   TETRA_DROP_NO_CALL=1           -> legacy clear-call filter (default
-                                    off, unusable on this build).
+                                    off).
 
 Encryption indicator: short-form FUNCs (D-SETUP, D-CONNECT, D-RELEASE,
 D-TX CEASED) carry an `ENCR:N` field where 0=clear and ≠0=encrypted.
@@ -67,7 +78,7 @@ try:
     TETRA_ENC_RATIO_THRESHOLD = float(os.environ.get("TETRA_ENC_RATIO_THRESHOLD", "0"))
 except ValueError:
     TETRA_ENC_RATIO_THRESHOLD = 0.0
-TETRA_ENC_RATIO_LOG_EVERY = 25  # log enc_ratio every Nth voice frame
+TETRA_ENC_RATIO_LOG_EVERY = 10  # log enc_ratio every Nth voice frame
 
 ACELP_FRAME_SIZE = 1380
 PCM_OUTPUT_BYTES = 960
@@ -116,20 +127,37 @@ def debug_dump(label, data, max_bytes=128):
 
 # ---------- Encryption-ratio heuristic (Bug 13, Option A) ----------
 
-def _enc_ratio(acelp_data):
-    """zlib compression ratio of an ACELP voice frame.
-
-    Clear bursts: speech-correlated sign patterns, ratio low (~0.5–0.85).
-    Encrypted bursts: near-uniform random signs, ratio high (~0.9–1.0).
-
-    Returns 1.0 (== "treat as encrypted") for empty/short input.
-    """
-    if not acelp_data or len(acelp_data) < 32:
+def _zlib_ratio(buf):
+    if not buf:
         return 1.0
     try:
-        return len(zlib.compress(acelp_data, 6)) / len(acelp_data)
+        return len(zlib.compress(buf, 6)) / len(buf)
     except Exception:
         return 1.0
+
+
+def _sign_bytes(acelp_data):
+    """Extract the high byte of each int16 little-endian sample.
+
+    For ±127 soft-bits this byte is 0x00 (positive) or 0xFF (negative),
+    i.e. the sign indicator. Returns 690 bytes.
+    """
+    return bytes(acelp_data[1::2])
+
+
+def _enc_ratio(acelp_data):
+    """Discriminating ratio for clear vs encrypted ACELP burst.
+
+    Clear bursts: sign sequence of soft-bits is correlated (speech
+    structure) -> compresses well -> low ratio.
+    Encrypted bursts: signs near-uniform random -> poor compression
+    -> ratio close to 1.0.
+
+    Returns 1.0 for empty/short input (treated as encrypted).
+    """
+    if not acelp_data or len(acelp_data) < 64:
+        return 1.0
+    return _zlib_ratio(_sign_bytes(acelp_data))
 
 
 # ---------- Active clear-call tracking (legacy Bug 12, default off) ----------
@@ -630,14 +658,18 @@ def main():
                 TETRA_DROP_NO_CALL and not _has_active_clear_call())
 
             if TETRA_DEBUG and (enc_frame_index[0] % TETRA_ENC_RATIO_LOG_EVERY) == 0:
+                # Log both metrics so we can see whether sign-only is
+                # actually discriminating (the full-frame ratio was not).
+                ratio_full = _zlib_ratio(acelp_data)
                 debug_dump(
                     'enc_ratio',
-                    ('frame={} ratio={:.3f} threshold={:.3f} drop_ratio={} '
-                     'drop_no_call={}').format(
-                        enc_frame_index[0], ratio, TETRA_ENC_RATIO_THRESHOLD,
+                    ('frame={} sign={:.3f} full={:.3f} thr={:.3f} '
+                     'drop_ratio={} drop_no_call={}').format(
+                        enc_frame_index[0], ratio, ratio_full,
+                        TETRA_ENC_RATIO_THRESHOLD,
                         int(ratio_says_drop), int(no_call_says_drop)
                     ).encode(),
-                    max_bytes=128)
+                    max_bytes=160)
 
             if ratio_says_drop:
                 drop_enc_count[0] += 1
