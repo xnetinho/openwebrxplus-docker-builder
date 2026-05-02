@@ -7,23 +7,26 @@ Writes JSON metadata to stderr (TETMON signaling: network info, calls).
 
 Per-frame encryption filtering (Bug 13, Option A):
   This build of osmo-tetra-sq5bpf emits voice bursts even for encrypted
-  calls — the codec then produces noise with vocal envelope. We use a
-  zlib compression-ratio heuristic on each ACELP payload to drop
-  bursts that look uniform-random (likely encrypted).
+  calls — the codec then produces noise with vocal envelope. We try to
+  drop bursts that look uniform-random.
 
-  The 1380-byte ACELP frame is 690 × int16 soft-bits at ±127 magnitudes
-  after Viterbi. The whole frame is dominated by 4 byte values
-  (0x7F/0x81/0x00/0xFF) regardless of clear vs encrypted, so zlib on
-  the full frame gives the same ratio for both classes (~0.11). The
-  discriminating signal lives in the SIGN PATTERN of the soft-bits:
-  speech has correlated signs, encrypted is near-uniform random. We
-  therefore compute the zlib ratio over the high byte of each int16
-  (= the sign indicator).
+  Calibration so far showed neither zlib(full frame) nor zlib(sign
+  bytes) discriminate clear from encrypted on this build (both classes
+  cluster at the same ratio, because the byte alphabet of the soft-bit
+  format is too small for zlib to exploit). We log multiple candidate
+  metrics in parallel so the user can pick (or rule out) one:
 
-  Threshold via `TETRA_ENC_RATIO_THRESHOLD` (float, default 0 = filter
-  off pending calibration). When `TETRA_DEBUG=1`, every Nth frame's
-  ratios are logged so the user can pick a threshold from a real
-  capture containing both clear and scrambled bursts.
+    `full` = zlib ratio over the full 1380-byte frame
+    `sign` = zlib ratio over the high byte (sign indicator) of each
+             int16 LE soft-bit (690 bytes)
+    `bits` = zlib ratio over the sign sequence packed to bits
+             (690 bits → 87 bytes)
+    `flip` = bit-flip rate (consecutive-sign transitions / 689).
+             Random encrypted ≈ 0.5; speech-correlated < 0.5.
+
+  Filter selection via `TETRA_ENC_METRIC` (`sign`, `bits`, `flip`,
+  `full`; default `sign`). Threshold via `TETRA_ENC_RATIO_THRESHOLD`
+  (float, default 0 = filter off pending calibration).
 
   The earlier signaling-based filter (Bug 12) is preserved but
   defaults to off (`TETRA_DROP_NO_CALL=0`).
@@ -34,9 +37,9 @@ Debug:
   TETRA_PCM_DUMP=/path.raw       -> appends each PCM chunk to file.
                                     Listen with `aplay -r 8000 -f S16_LE
                                     -c 1 ...`.
-  TETRA_ENC_RATIO_THRESHOLD=0.85 -> drop bursts with sign-zlib ratio
-                                    above this value (Option A filter;
-                                    0 = off).
+  TETRA_ENC_METRIC=sign          -> which metric drives the filter.
+  TETRA_ENC_RATIO_THRESHOLD=0    -> drop frames whose chosen metric
+                                    exceeds threshold (0 = off).
   TETRA_DROP_NO_CALL=1           -> legacy clear-call filter (default
                                     off).
 
@@ -78,7 +81,10 @@ try:
     TETRA_ENC_RATIO_THRESHOLD = float(os.environ.get("TETRA_ENC_RATIO_THRESHOLD", "0"))
 except ValueError:
     TETRA_ENC_RATIO_THRESHOLD = 0.0
-TETRA_ENC_RATIO_LOG_EVERY = 10  # log enc_ratio every Nth voice frame
+TETRA_ENC_METRIC = os.environ.get("TETRA_ENC_METRIC", "sign").lower()
+if TETRA_ENC_METRIC not in ("full", "sign", "bits", "flip"):
+    TETRA_ENC_METRIC = "sign"
+TETRA_ENC_RATIO_LOG_EVERY = 10  # log all metrics every Nth voice frame
 
 ACELP_FRAME_SIZE = 1380
 PCM_OUTPUT_BYTES = 960
@@ -95,11 +101,12 @@ try:
     _DEBUG_FH = open(TETRA_DEBUG_FILE, 'a', buffering=1)
     _DEBUG_FH.write(
         '\n=== tetra_decoder.py startup at {} | TETRA_DEBUG={} | PCM_DUMP={} | '
-        'DROP_NO_CALL={} | ENC_RATIO_THRESHOLD={} ===\n'.format(
+        'DROP_NO_CALL={} | ENC_METRIC={} | ENC_RATIO_THRESHOLD={} ===\n'.format(
             datetime.datetime.now().isoformat(timespec='seconds'),
             'on' if TETRA_DEBUG else 'off',
             TETRA_PCM_DUMP or 'off',
             'on' if TETRA_DROP_NO_CALL else 'off',
+            TETRA_ENC_METRIC,
             TETRA_ENC_RATIO_THRESHOLD if TETRA_ENC_RATIO_THRESHOLD > 0 else 'off'))
 except Exception:
     _DEBUG_FH = None
@@ -125,7 +132,7 @@ def debug_dump(label, data, max_bytes=128):
         pass
 
 
-# ---------- Encryption-ratio heuristic (Bug 13, Option A) ----------
+# ---------- Encryption-discriminator candidate metrics (Bug 13) ----------
 
 def _zlib_ratio(buf):
     if not buf:
@@ -137,27 +144,50 @@ def _zlib_ratio(buf):
 
 
 def _sign_bytes(acelp_data):
-    """Extract the high byte of each int16 little-endian sample.
-
-    For ±127 soft-bits this byte is 0x00 (positive) or 0xFF (negative),
-    i.e. the sign indicator. Returns 690 bytes.
-    """
+    """High byte of each int16 LE sample. 0x00=positive, 0xFF=negative."""
     return bytes(acelp_data[1::2])
 
 
-def _enc_ratio(acelp_data):
-    """Discriminating ratio for clear vs encrypted ACELP burst.
+def _sign_bits_packed(acelp_data):
+    """Sign bits packed 8-per-byte. 690 signs -> 87 bytes (last bits zero-padded)."""
+    high = acelp_data[1::2]
+    out = bytearray((len(high) + 7) >> 3)
+    for i, b in enumerate(high):
+        if b & 0x80:
+            out[i >> 3] |= 1 << (i & 7)
+    return bytes(out)
 
-    Clear bursts: sign sequence of soft-bits is correlated (speech
-    structure) -> compresses well -> low ratio.
-    Encrypted bursts: signs near-uniform random -> poor compression
-    -> ratio close to 1.0.
 
-    Returns 1.0 for empty/short input (treated as encrypted).
+def _sign_flip_rate(acelp_data):
+    """Fraction of consecutive-sample sign transitions in the soft-bit
+    sequence. Random encrypted ≈ 0.5; structured speech < 0.5.
     """
+    high = acelp_data[1::2]
+    n = len(high)
+    if n < 2:
+        return 0.5
+    flips = 0
+    for i in range(1, n):
+        if high[i] != high[i - 1]:
+            flips += 1
+    return flips / (n - 1)
+
+
+def _all_metrics(acelp_data):
+    """Compute all four candidate discriminators for a single frame."""
     if not acelp_data or len(acelp_data) < 64:
-        return 1.0
-    return _zlib_ratio(_sign_bytes(acelp_data))
+        return {"full": 1.0, "sign": 1.0, "bits": 1.0, "flip": 0.5}
+    return {
+        "full": _zlib_ratio(acelp_data),
+        "sign": _zlib_ratio(_sign_bytes(acelp_data)),
+        "bits": _zlib_ratio(_sign_bits_packed(acelp_data)),
+        "flip": _sign_flip_rate(acelp_data),
+    }
+
+
+def _select_metric(metrics, name):
+    """Return the value of the active metric, or 1.0 if unknown."""
+    return metrics.get(name, 1.0)
 
 
 # ---------- Active clear-call tracking (legacy Bug 12, default off) ----------
@@ -651,25 +681,36 @@ def main():
             debug_dump('acelp', acelp_data, max_bytes=32)
             enc_frame_index[0] += 1
 
-            ratio = _enc_ratio(acelp_data)
-            ratio_says_drop = (
-                TETRA_ENC_RATIO_THRESHOLD > 0 and ratio > TETRA_ENC_RATIO_THRESHOLD)
+            log_now = (TETRA_DEBUG and
+                       (enc_frame_index[0] % TETRA_ENC_RATIO_LOG_EVERY) == 0)
+            need_metric = TETRA_ENC_RATIO_THRESHOLD > 0
+            if log_now or need_metric:
+                metrics = _all_metrics(acelp_data)
+            else:
+                metrics = None
+
+            if need_metric and metrics is not None:
+                value = _select_metric(metrics, TETRA_ENC_METRIC)
+                ratio_says_drop = value > TETRA_ENC_RATIO_THRESHOLD
+            else:
+                value = 0.0
+                ratio_says_drop = False
             no_call_says_drop = (
                 TETRA_DROP_NO_CALL and not _has_active_clear_call())
 
-            if TETRA_DEBUG and (enc_frame_index[0] % TETRA_ENC_RATIO_LOG_EVERY) == 0:
-                # Log both metrics so we can see whether sign-only is
-                # actually discriminating (the full-frame ratio was not).
-                ratio_full = _zlib_ratio(acelp_data)
+            if log_now and metrics is not None:
                 debug_dump(
                     'enc_ratio',
-                    ('frame={} sign={:.3f} full={:.3f} thr={:.3f} '
+                    ('frame={} full={:.3f} sign={:.3f} bits={:.3f} '
+                     'flip={:.3f} active={} thr={:.3f} '
                      'drop_ratio={} drop_no_call={}').format(
-                        enc_frame_index[0], ratio, ratio_full,
-                        TETRA_ENC_RATIO_THRESHOLD,
+                        enc_frame_index[0],
+                        metrics['full'], metrics['sign'],
+                        metrics['bits'], metrics['flip'],
+                        TETRA_ENC_METRIC, TETRA_ENC_RATIO_THRESHOLD,
                         int(ratio_says_drop), int(no_call_says_drop)
                     ).encode(),
-                    max_bytes=160)
+                    max_bytes=200)
 
             if ratio_says_drop:
                 drop_enc_count[0] += 1
