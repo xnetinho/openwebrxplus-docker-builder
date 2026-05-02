@@ -7,26 +7,32 @@ Writes JSON metadata to stderr (TETMON signaling: network info, calls).
 
 Per-frame encryption filtering (Bug 13, Option A):
   This build of osmo-tetra-sq5bpf emits voice bursts even for encrypted
-  calls — the codec then produces noise with vocal envelope. We try to
-  drop bursts that look uniform-random.
+  calls. We try to drop bursts that look uniform-random.
 
-  Calibration so far showed neither zlib(full frame) nor zlib(sign
-  bytes) discriminate clear from encrypted on this build (both classes
-  cluster at the same ratio, because the byte alphabet of the soft-bit
-  format is too small for zlib to exploit). We log multiple candidate
-  metrics in parallel so the user can pick (or rule out) one:
+  Calibration runs showed metrics computed over the full 690-int16
+  cdecoder frame don't discriminate: out of 690 positions, 258 are
+  fixed (magic header at pos 0, three gap markers at 115/230/345,
+  and zero filler at 436..689). Only 432 positions carry actual
+  soft-bits. The 254-zero filler dominates zlib output and swamps the
+  signal/noise ratio, collapsing both classes to the same cluster.
 
-    `full` = zlib ratio over the full 1380-byte frame
-    `sign` = zlib ratio over the high byte (sign indicator) of each
-             int16 LE soft-bit (690 bytes)
-    `bits` = zlib ratio over the sign sequence packed to bits
-             (690 bits → 87 bytes)
-    `flip` = bit-flip rate (consecutive-sign transitions / 689).
-             Random encrypted ≈ 0.5; speech-correlated < 0.5.
+  We expose two parallel sets of metrics: (1) over the full frame
+  (control), and (2) over the soft-bit window only (bytes 2..872 in
+  the 1380-byte payload, i.e. int16 positions 1..435 skipping magic
+  and filler).
 
-  Filter selection via `TETRA_ENC_METRIC` (`sign`, `bits`, `flip`,
-  `full`; default `sign`). Threshold via `TETRA_ENC_RATIO_THRESHOLD`
-  (float, default 0 = filter off pending calibration).
+    `full`   = zlib ratio over the full 1380-byte frame
+    `sign`   = zlib ratio over 690 sign bytes
+    `bits`   = zlib ratio over 690 sign bits packed (87 bytes)
+    `flip`   = bit-flip rate over 690 sign bytes
+    `signD`  = zlib ratio over 435 sign bytes (data window only)
+    `bitsD`  = zlib ratio over 435 sign bits packed (55 bytes)
+    `flipD`  = bit-flip rate over 435 sign bytes (data window only)
+
+  Filter selection via `TETRA_ENC_METRIC` (`full|sign|bits|flip|
+  signD|bitsD|flipD`; default `bitsD`). Threshold via
+  `TETRA_ENC_RATIO_THRESHOLD` (float, default 0 = filter off pending
+  calibration).
 
   The earlier signaling-based filter (Bug 12) is preserved but
   defaults to off (`TETRA_DROP_NO_CALL=0`).
@@ -37,7 +43,7 @@ Debug:
   TETRA_PCM_DUMP=/path.raw       -> appends each PCM chunk to file.
                                     Listen with `aplay -r 8000 -f S16_LE
                                     -c 1 ...`.
-  TETRA_ENC_METRIC=sign          -> which metric drives the filter.
+  TETRA_ENC_METRIC=bitsD         -> which metric drives the filter.
   TETRA_ENC_RATIO_THRESHOLD=0    -> drop frames whose chosen metric
                                     exceeds threshold (0 = off).
   TETRA_DROP_NO_CALL=1           -> legacy clear-call filter (default
@@ -81,14 +87,23 @@ try:
     TETRA_ENC_RATIO_THRESHOLD = float(os.environ.get("TETRA_ENC_RATIO_THRESHOLD", "0"))
 except ValueError:
     TETRA_ENC_RATIO_THRESHOLD = 0.0
-TETRA_ENC_METRIC = os.environ.get("TETRA_ENC_METRIC", "sign").lower()
-if TETRA_ENC_METRIC not in ("full", "sign", "bits", "flip"):
-    TETRA_ENC_METRIC = "sign"
+_VALID_METRICS = ("full", "sign", "bits", "flip", "signD", "bitsD", "flipD")
+TETRA_ENC_METRIC = os.environ.get("TETRA_ENC_METRIC", "bitsD")
+if TETRA_ENC_METRIC not in _VALID_METRICS:
+    TETRA_ENC_METRIC = "bitsD"
 TETRA_ENC_RATIO_LOG_EVERY = 10  # log all metrics every Nth voice frame
 
 ACELP_FRAME_SIZE = 1380
 PCM_OUTPUT_BYTES = 960
 CALL_STALE_TIMEOUT = 30.0  # seconds without renewal -> drop SSI
+
+# Soft-bit window in the cdecoder frame:
+#   - Skip int16 position 0 (magic 0x6B21 header)
+#   - Cover positions 1..435 (432 soft-bits + 3 zero-gap markers)
+#   - Skip positions 436..689 (zero filler that swamps zlib metrics)
+# In bytes: [2 : 872], 435 int16s = 870 bytes.
+SOFT_BIT_BYTES_START = 2
+SOFT_BIT_BYTES_END = 872
 
 # Unified audio header pattern.
 AUDIO_PATTERN = re.compile(
@@ -143,50 +158,61 @@ def _zlib_ratio(buf):
         return 1.0
 
 
-def _sign_bytes(acelp_data):
+def _signs_of(buf):
     """High byte of each int16 LE sample. 0x00=positive, 0xFF=negative."""
-    return bytes(acelp_data[1::2])
+    return bytes(buf[1::2])
 
 
-def _sign_bits_packed(acelp_data):
-    """Sign bits packed 8-per-byte. 690 signs -> 87 bytes (last bits zero-padded)."""
-    high = acelp_data[1::2]
-    out = bytearray((len(high) + 7) >> 3)
-    for i, b in enumerate(high):
+def _bits_packed(signs):
+    """Pack the sign bytes (0x00/0xFF) to 1 bit each, 8 per output byte."""
+    out = bytearray((len(signs) + 7) >> 3)
+    for i, b in enumerate(signs):
         if b & 0x80:
             out[i >> 3] |= 1 << (i & 7)
     return bytes(out)
 
 
-def _sign_flip_rate(acelp_data):
-    """Fraction of consecutive-sample sign transitions in the soft-bit
-    sequence. Random encrypted ≈ 0.5; structured speech < 0.5.
-    """
-    high = acelp_data[1::2]
-    n = len(high)
+def _flip_rate(signs):
+    """Fraction of consecutive sign transitions in a sign byte sequence."""
+    n = len(signs)
     if n < 2:
         return 0.5
     flips = 0
     for i in range(1, n):
-        if high[i] != high[i - 1]:
+        if signs[i] != signs[i - 1]:
             flips += 1
     return flips / (n - 1)
 
 
 def _all_metrics(acelp_data):
-    """Compute all four candidate discriminators for a single frame."""
+    """Compute all candidate discriminators for one frame."""
     if not acelp_data or len(acelp_data) < 64:
-        return {"full": 1.0, "sign": 1.0, "bits": 1.0, "flip": 0.5}
-    return {
+        return {k: 1.0 for k in _VALID_METRICS}
+
+    # Full-frame variants (control)
+    full_signs = _signs_of(acelp_data)
+    full_metrics = {
         "full": _zlib_ratio(acelp_data),
-        "sign": _zlib_ratio(_sign_bytes(acelp_data)),
-        "bits": _zlib_ratio(_sign_bits_packed(acelp_data)),
-        "flip": _sign_flip_rate(acelp_data),
+        "sign": _zlib_ratio(full_signs),
+        "bits": _zlib_ratio(_bits_packed(full_signs)),
+        "flip": _flip_rate(full_signs),
     }
+
+    # Data-window variants (skip magic + filler)
+    if len(acelp_data) >= SOFT_BIT_BYTES_END:
+        win = acelp_data[SOFT_BIT_BYTES_START:SOFT_BIT_BYTES_END]
+    else:
+        win = acelp_data[SOFT_BIT_BYTES_START:]
+    win_signs = _signs_of(win)
+    full_metrics.update({
+        "signD": _zlib_ratio(win_signs),
+        "bitsD": _zlib_ratio(_bits_packed(win_signs)),
+        "flipD": _flip_rate(win_signs),
+    })
+    return full_metrics
 
 
 def _select_metric(metrics, name):
-    """Return the value of the active metric, or 1.0 if unknown."""
     return metrics.get(name, 1.0)
 
 
@@ -693,7 +719,6 @@ def main():
                 value = _select_metric(metrics, TETRA_ENC_METRIC)
                 ratio_says_drop = value > TETRA_ENC_RATIO_THRESHOLD
             else:
-                value = 0.0
                 ratio_says_drop = False
             no_call_says_drop = (
                 TETRA_DROP_NO_CALL and not _has_active_clear_call())
@@ -702,15 +727,16 @@ def main():
                 debug_dump(
                     'enc_ratio',
                     ('frame={} full={:.3f} sign={:.3f} bits={:.3f} '
-                     'flip={:.3f} active={} thr={:.3f} '
-                     'drop_ratio={} drop_no_call={}').format(
+                     'flip={:.3f} signD={:.3f} bitsD={:.3f} flipD={:.3f} '
+                     'active={} thr={:.3f} drop_ratio={} drop_no_call={}').format(
                         enc_frame_index[0],
                         metrics['full'], metrics['sign'],
                         metrics['bits'], metrics['flip'],
+                        metrics['signD'], metrics['bitsD'], metrics['flipD'],
                         TETRA_ENC_METRIC, TETRA_ENC_RATIO_THRESHOLD,
                         int(ratio_says_drop), int(no_call_says_drop)
                     ).encode(),
-                    max_bytes=200)
+                    max_bytes=256)
 
             if ratio_says_drop:
                 drop_enc_count[0] += 1
