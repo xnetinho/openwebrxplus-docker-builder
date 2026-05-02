@@ -1,7 +1,7 @@
 # TETRA Frequency Monitoring Branch — Status & Roadmap
 
 Branch: `claude/tetra-frequency-monitoring-3IqM9`
-Last updated: 2026-05-01 (session 5)
+Last updated: 2026-05-02 (session 6)
 
 Purpose: fix the TETRA decoder pipeline so the OpenWebRX+ panel matches
 reality and unencrypted voice traffic plays back as audio.
@@ -205,13 +205,14 @@ build. Filter remains in code (gated by `TETRA_DROP_NO_CALL`, default
 ON) but is effectively unusable until replaced — user must set
 `TETRA_DROP_NO_CALL=0` to get audio at all.
 
-### Bug 13 — Need a frame-level encryption indicator (OPEN — analysis complete)
+### Bug 13 — Frame-level encryption indicator (DECISION: Option A — IMPLEMENTING)
 
 To fix Bug 11 we need to drop encrypted ACELP bursts on a per-frame
 basis (signaling cannot be the source of truth — see Bug 12).
 
-**Upstream investigation (session 5)**: read
-`sq5bpf/osmo-tetra-sq5bpf-2/src/lower_mac/tetra_lower_mac.c` via
+#### Upstream investigation (session 5)
+
+Read `sq5bpf/osmo-tetra-sq5bpf-2/src/lower_mac/tetra_lower_mac.c` via
 WebFetch. The voice-frame passthrough is:
 
 ```c
@@ -229,22 +230,88 @@ sprintf(tmpstr,"TRA:%2.2x RX:%2.2x DECR:%i\0",
 Crucially, `decrypted=0` is emitted both for **clear** bursts (no
 keystream needed) and for **encrypted bursts we couldn't decrypt**
 (no key loaded). They are indistinguishable in the passthrough header.
+No other variable (`encrypted_burst`, `encr_burst`, `kss_failed`,
+`encryption_used`, …) exists upstream that flags "this burst was
+encrypted regardless of decryption outcome". The header carries
+`DECR` only.
 
-A grep of the upstream source confirmed: **no other variable**
-(`encrypted_burst`, `encr_burst`, `kss_failed`, `encryption_used`, …)
-exists that flags "this burst was encrypted regardless of decryption
-outcome". The header carries `DECR` only.
+#### Reference: TetraEar (aruznieto, session 6)
 
-Implication: for a TEA2/TEA3 cell **without keys**, no header-based
-filter can separate clear from encrypted. Three remaining paths:
+Read `aruznieto/TetraEar/tetraear/core/protocol.py` via WebFetch.
+TetraEar is a complete Python TETRA decoder (does NOT use osmo-tetra)
+and exposes how encryption is detected at the MAC layer:
 
-| Option | Approach | Risk / cost |
-|---|---|---|
-| A | Statistical detection on the 1380-byte ACELP payload (entropy / χ² — encrypted is near-uniform, clear has structure). Gate codec.feed() per frame. | Medium. ~80 LOC Python; needs calibration with the existing PCM dump. Risk of false positives on silence/whisper bursts. |
-| B | Patch upstream `tetra_lower_mac.c` to read the MAC PDU encryption-mode bit and emit a real `ENC:N` field in the passthrough header. | High. Modify C, rebuild osmo-tetra in the Docker image. Authoritative result. |
-| C | Accept mixed audio. Set `TETRA_DROP_NO_CALL=0` and document the limitation. | Zero cost. No real fix. |
+```python
+encryption_mode = _bits_to_uint(bits, cur, 2); cur += 2
+encrypted = encryption_mode > 0
+```
 
-Decision pending — user to choose A, B, or C.
+Two bits in the MAC PDU header (immediately after `frame_type`) are
+the ETSI EN 300 392-2 encryption-mode field:
+
+| Value | Meaning |
+|---|---|
+| 0 | Clear |
+| 1 | Class 2 (SCK) — TEA1 |
+| 2 | Class 3 (DCK) — TEA2 |
+| 3 | Reserved |
+
+So the information **does** exist at the MAC layer — `osmo-tetra` parses
+it internally for keystream lookup but doesn't expose it on the hack
+socket. Path B (upstream patch) would extract this 2-bit field and
+add it to the passthrough sprintf.
+
+TetraEar uses **layered detection**:
+  1. MAC header bits (primary).
+  2. `mac_pdu.encrypted` boolean (secondary).
+  3. **Entropy ratio** of payload (fallback): `unique_bytes/total > 0.7
+     and total_bytes > 8 → encrypted`.
+  4. Call-metadata override.
+  5. SDS heuristic (`[BIN`-prefixed text → encrypted).
+
+The fallback (3) is implementable in pure Python without any C
+modification — exactly Option A.
+
+TetraEar also confirms our understanding of the cdecoder input format.
+`extract_codec_input(bits)` builds a 690-element int16 array
+(= 1380 bytes), with `block[0] = 0x6B21` and 432 soft-bits stuffed
+at indices 1..114, 116..229, 231..344, 346..435 (skipping positions
+0, 115, 230, 345). The 0x21 0x6B prefix matches what we observed in
+log v3, confirming our pipeline already feeds the codec the right
+format. **Bug 11 is not an input-format mismatch.**
+
+#### Decision: Option A (statistical detection)
+
+Justification:
+  - Validated by TetraEar's own code (used as fallback even when MAC
+    header is available).
+  - Zero changes to Docker / upstream / tetra-rx binary.
+  - Calibratable with the user's existing PCM dump (Bug 11 step).
+  - ~30 LOC Python in `tetra_decoder.py`.
+  - If statistical detection proves insufficient, Option B (upstream
+    patch) remains available as an upgrade.
+
+User approved Option A on 2026-05-02 (session 6).
+
+#### Adaptation note: byte-uniqueness heuristic vs ACELP soft-bits
+
+The TetraEar entropy ratio (`unique_bytes / total > 0.7`) is meant for
+**byte-level MAC PDU data** — variable content with structural
+redundancy when clear and uniform-random when encrypted.
+
+Our 1380-byte payload is **not** raw bytes: it's 690 × int16 soft-bits
+(values clustered around ±127 after Viterbi), giving only ~5–6 unique
+byte values *regardless of clear/encrypted*. Direct application of
+the TetraEar formula would give the same ratio for both classes.
+
+Implementation therefore adapts the metric: instead of byte
+uniqueness, compute the **zlib compression ratio** of the full ACELP
+frame (or alternatively of just the sign-bit sequence). Clear voice
+has correlated sign patterns from real speech → compresses better
+(low ratio). Encrypted voice has near-uniform random signs → poor
+compression (high ratio). Threshold to be calibrated against a real
+capture containing both clear and scrambled bursts; default OFF
+(no filtering) until first calibration.
 
 ---
 
@@ -266,6 +333,7 @@ Decision pending — user to choose A, B, or C.
 | `fec8ff9` | `tetra_decoder.py` | Drop `-e` flag from tetra-rx (passthrough corruption) |
 | `6ff2e36` | `tetra_decoder.py` | Add TETRA_PCM_DUMP env for offline `aplay` diagnosis |
 | `f0ed4d2` | `tetra_decoder.py` | Active-clear-call filter via short-form FUNC ENCR (Bug 12 — failed) |
+| `7b464a5` | `docs/tetra-fix-status.md` | Register Bug 11 outcome, failed Bug 12, upstream DECR findings |
 
 ---
 
@@ -303,25 +371,31 @@ resource     func, ssi, idt, ssi2?
 | 0 ACELP frames extracted | -> ACELP extraction working | YES (in dump after `b47abd1`) |
 | Panel freezes on first ACELP | -> panel keeps updating | YES (`52d8833`) |
 | Periodic 300ms-intelligible voice | -> still mixed clear+scrambled | NO — see Bug 11 |
-| TEA1 false positive on clear calls | -> ENCC-derived encryption | superseded — ENCC doesn't exist on this build |
+| TEA1 false positive on clear calls | -> ENCR-derived encryption | superseded — ENCC doesn't exist on this build |
 | Mixed clear+scrambled audio in browser | -> still mixed offline (`.raw` confirms) | confirmed in pipeline (Bug 11) |
 | `TETRA_DROP_NO_CALL=1` filters encrypted | -> total silence (Bug 12) | filter unusable on this build |
+| Bug 13 Option A statistical filter | -> pending implementation + calibration | open |
 
 ---
 
 ## Open work
 
-### Bug 13 — Pick A / B / C (next decision point)
+### Bug 13 — Implement Option A (next)
 
-Source-of-truth investigation is done. The header passthrough has no
-"this burst was encrypted" flag. User to pick:
-
-- **A** statistical: probably-fast, may have false positives.
-- **B** upstream patch: probably-correct, more invasive.
-- **C** accept mixed audio: no work, no fix.
-
-Workaround in the meantime: `TETRA_DROP_NO_CALL=0` to disable the
-useless-on-this-build filter and revert to mixed audio.
+1. Add `_enc_ratio(acelp_data)` in `tetra_decoder.py` returning the
+   zlib(level=6) compressed-size ratio of the 1380-byte payload.
+2. Add `TETRA_ENC_RATIO_THRESHOLD` env var (float, default `0.0` =
+   filter disabled). Frames whose ratio exceeds the threshold are
+   dropped.
+3. Log per-frame ratios via `debug_dump('enc_ratio', ...)` every N
+   frames so the user can calibrate from a real capture containing
+   both clear and scrambled bursts.
+4. Default `TETRA_DROP_NO_CALL=0` to neutralise the Bug 12 filter
+   (the new statistical filter supersedes it).
+5. User calibration step: capture log + PCM dump with the new
+   build, plot the ratio distribution, pick a threshold separating
+   clear bursts (low ratio) from encrypted bursts (high ratio), set
+   `TETRA_ENC_RATIO_THRESHOLD` accordingly.
 
 ### Frontend: SCK-locked badge state
 
@@ -357,12 +431,11 @@ clear it). Cosmetic.
 
 ---
 
-## Reference comparison: mbbrzoza/OpenWebRX-Tetra-Plugin
+## Reference comparisons
 
-During session 2 we compared our pipeline against
-[mbbrzoza/OpenWebRX-Tetra-Plugin](https://github.com/mbbrzoza/OpenWebRX-Tetra-Plugin),
-which uses the same `osmo-tetra-sq5bpf` upstream and ETSI codec. Key
-diffs found:
+### mbbrzoza/OpenWebRX-Tetra-Plugin (session 2)
+
+Same `osmo-tetra-sq5bpf` upstream + ETSI codec. Diffs after our fixes:
 
 | Aspect | Reference | Ours (post-fixes) |
 |---|---|---|
@@ -377,11 +450,23 @@ diffs found:
 | Mixed clear/encrypted audio on TEA2 cell | same problem (untested) | same problem — see Bug 11/13 |
 
 The reference does not split cell-capability from active-call encryption,
-nor does it use ENCR-driven gating. Our improvements there go beyond
-what the reference does. The audio pipeline differences after our
-fixes are functionally equivalent on clear-only cells; the open
-issue (Bug 11/13) likely affects the reference plugin too on
-TEA2-capable cells.
+nor does it use ENCR-driven gating, nor any per-frame encryption
+detection. Our improvements there go beyond what the reference does.
+
+### aruznieto/TetraEar (session 6)
+
+Pure-Python TETRA decoder (does NOT use osmo-tetra). Relevant bits:
+
+| Aspect | TetraEar | Ours |
+|---|---|---|
+| Upstream | Reimplements lower MAC + protocol in Python | Uses osmo-tetra-sq5bpf binary |
+| Encryption detection | MAC header 2-bit field + entropy fallback + call-meta override + SDS heuristic | Currently signaling-only (Bug 12, broken). Pending Option A statistical |
+| Codec format | builds 690 × int16 soft-bits, header `0x6B21` | tetra-rx already emits this format (verified via log v3) |
+| Auto-decrypt | yes (loads keys from `keys.txt`) | no key loaded; encrypted bursts pass through as garbage |
+
+TetraEar's MAC-layer parsing confirms encryption mode is exposable
+from a fork of osmo-tetra (Option B is well-defined). Their entropy
+fallback validates Option A as a reasonable approach.
 
 ---
 
@@ -391,4 +476,5 @@ TEA2-capable cells.
 - **Session 2**: Bugs 5, 6, 7, 9, 10 fixed; reference plugin comparison; async codec pipeline; ENCC parsing introduced (later proven wrong).
 - **Session 3**: Bug 8 (`-e` flag) fixed; PCM-dump diagnostic step added (Bug 11 isolation).
 - **Session 4**: User confirmed offline `.raw` is identical to browser audio → artefact is in pipeline (not OWRX+ chain). Log v3 analysis: ENCC absent, ENCR present (79 events all `ENCR:0`); voice frames precede first short-form FUNC by 125 frames. Active-clear-call filter implemented (Bug 12, commit `f0ed4d2`).
-- **Session 5**: Log v4 analysis: 0 ENCR fields in 403 MB capture, 100% frame drop, total silence — Bug 12 unusable. WebFetch on upstream `osmo-tetra-sq5bpf-2` confirms no encryption flag exists in passthrough header beyond `DECR` (which is decryption-success, not encryption-detected). Bug 13 opened with three options (A statistical / B upstream patch / C accept). Pending user decision.
+- **Session 5**: Log v4 analysis: 0 ENCR fields in 403 MB capture, 100% frame drop, total silence — Bug 12 unusable. WebFetch on upstream `osmo-tetra-sq5bpf-2` confirms no encryption flag exists in passthrough header beyond `DECR` (which is decryption-success, not encryption-detected). Bug 13 opened with three options (A statistical / B upstream patch / C accept).
+- **Session 6**: WebFetch on `aruznieto/TetraEar` confirms (a) MAC PDU has 2-bit encryption_mode field, (b) TetraEar uses entropy ratio as fallback heuristic, (c) cdecoder input format we send is correct. User approved Option A. Bug 13 implementation pending.
