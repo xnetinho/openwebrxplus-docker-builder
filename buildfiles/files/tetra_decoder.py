@@ -14,9 +14,15 @@ Per-TS voice demultiplexing (Bug 14, Option B):
   TNs are dropped until the locked TN goes silent for
   `TETRA_TN_LOCK_TIMEOUT` seconds.
 
-  This avoids the previous behaviour where bursts from concurrent
-  calls on different timeslots were fed to the same codec instance,
-  producing partially-intelligible "scrambled" audio (Bug 11/14).
+  Bug 14b — codec reset on lock release (default ON, controlled by
+  `TETRA_RESET_CODEC_ON_UNLOCK`). When the lock releases after the
+  silence gap, we kill and restart the cdecoder/sdecoder pair so the
+  next speaker starts with a fresh ACELP predictor / pitch buffer.
+  This avoids cross-speaker contamination when consecutive bursts
+  on the same TN belong to different SSIs (typical group-call
+  PTT handoff). Does NOT help when handoff happens with no
+  silence gap (continuous burst from multiple speakers); for that
+  case Bug 15 (per-SSI demux) is required.
 
   Backward-compat: if a frame arrives with the legacy 13-byte
   header (no TN field, e.g. unpatched binary in the image), the
@@ -25,21 +31,20 @@ Per-TS voice demultiplexing (Bug 14, Option B):
 Frame-level statistical filter (Bug 13, Option A — abandoned, kept
 as debug surface):
   Per-frame zlib / flip-rate metrics are computed only when
-  `TETRA_ENC_RATIO_THRESHOLD > 0`. Default 0 = no filtering. The
-  candidate metrics never showed clear/encrypted separation in
-  calibration, so this filter is effectively dormant.
+  `TETRA_ENC_RATIO_THRESHOLD > 0`. Default 0 = no filtering.
 
 Debug:
   TETRA_DEBUG=1                  -> dumps to /tmp/tetra-debug.log
                                     (override path with TETRA_DEBUG_FILE).
   TETRA_PCM_DUMP=/path.raw       -> appends each PCM chunk to file.
-                                    Listen with `aplay -r 8000 -f S16_LE
-                                    -c 1 ...`.
   TETRA_TN_LOCK_TIMEOUT=2.0      -> seconds of silence on locked TN
                                     before another TN can claim the
                                     codec. Set 0 to disable TN lock.
-  TETRA_ENC_METRIC=bitsD         -> which Bug 13 metric drives the
-                                    statistical filter (debug only).
+  TETRA_RESET_CODEC_ON_UNLOCK=1  -> kill+restart codec when TN lock
+                                    releases (Bug 14b). Default on.
+                                    Set 0 to keep the legacy
+                                    persistent-codec behaviour.
+  TETRA_ENC_METRIC=bitsD         -> Bug 13 statistical metric (debug).
   TETRA_ENC_RATIO_THRESHOLD=0    -> drop frames whose chosen metric
                                     exceeds threshold (0 = off).
   TETRA_DROP_NO_CALL=1           -> legacy clear-call filter (default
@@ -87,6 +92,7 @@ try:
     TETRA_TN_LOCK_TIMEOUT = float(os.environ.get("TETRA_TN_LOCK_TIMEOUT", "2.0"))
 except ValueError:
     TETRA_TN_LOCK_TIMEOUT = 2.0
+TETRA_RESET_CODEC_ON_UNLOCK = os.environ.get("TETRA_RESET_CODEC_ON_UNLOCK", "1") == "1"
 _VALID_METRICS = ("full", "sign", "bits", "flip", "signD", "bitsD", "flipD")
 TETRA_ENC_METRIC = os.environ.get("TETRA_ENC_METRIC", "bitsD")
 if TETRA_ENC_METRIC not in _VALID_METRICS:
@@ -99,11 +105,7 @@ CALL_STALE_TIMEOUT = 30.0  # seconds without renewal -> drop SSI
 HEADER_SIZE_NEW = 32       # patched upstream (Bug 14): 32-byte fixed header
 HEADER_SIZE_LEGACY = 13    # original upstream: 13-byte header, no TN
 
-# Soft-bit window in the cdecoder frame:
-#   - Skip int16 position 0 (magic 0x6B21 header)
-#   - Cover positions 1..435 (432 soft-bits + 3 zero-gap markers)
-#   - Skip positions 436..689 (zero filler that swamps zlib metrics)
-# In bytes: [2 : 872], 435 int16s = 870 bytes.
+# Soft-bit window in the cdecoder frame (skip magic + filler).
 SOFT_BIT_BYTES_START = 2
 SOFT_BIT_BYTES_END = 872
 
@@ -118,13 +120,14 @@ try:
     _DEBUG_FH = open(TETRA_DEBUG_FILE, 'a', buffering=1)
     _DEBUG_FH.write(
         '\n=== tetra_decoder.py startup at {} | TETRA_DEBUG={} | PCM_DUMP={} | '
-        'DROP_NO_CALL={} | TN_LOCK_TIMEOUT={} | ENC_METRIC={} | '
-        'ENC_RATIO_THRESHOLD={} ===\n'.format(
+        'DROP_NO_CALL={} | TN_LOCK_TIMEOUT={} | RESET_ON_UNLOCK={} | '
+        'ENC_METRIC={} | ENC_RATIO_THRESHOLD={} ===\n'.format(
             datetime.datetime.now().isoformat(timespec='seconds'),
             'on' if TETRA_DEBUG else 'off',
             TETRA_PCM_DUMP or 'off',
             'on' if TETRA_DROP_NO_CALL else 'off',
             TETRA_TN_LOCK_TIMEOUT if TETRA_TN_LOCK_TIMEOUT > 0 else 'off',
+            'on' if TETRA_RESET_CODEC_ON_UNLOCK else 'off',
             TETRA_ENC_METRIC,
             TETRA_ENC_RATIO_THRESHOLD if TETRA_ENC_RATIO_THRESHOLD > 0 else 'off'))
 except Exception:
@@ -372,8 +375,6 @@ def parse_audio_from_udp(data):
         return None
     payload = data[tra_pos:]
 
-    # New 32-byte format: read first 32 bytes, parse text up to first NUL,
-    # look for TN:N. If present, binary block starts at offset 32.
     if len(payload) >= HEADER_SIZE_NEW + ACELP_FRAME_SIZE:
         header_bytes = payload[:HEADER_SIZE_NEW]
         nul_pos = header_bytes.find(b'\x00')
@@ -390,7 +391,6 @@ def parse_audio_from_udp(data):
                 tn = -1
             return (tn, payload[HEADER_SIZE_NEW:HEADER_SIZE_NEW + ACELP_FRAME_SIZE])
 
-    # Legacy variable-length header (TRA:HH RX:HH\0 or TRA:HH RX:HH DECR:HH ).
     match = AUDIO_PATTERN_LEGACY.match(payload)
     if match is None:
         return None
@@ -432,7 +432,6 @@ def parse_metadata_from_udp(data):
     try: ssi = int(fields.get('SSI', '0'))
     except ValueError: ssi = 0
 
-    # ----- Short-form FUNCs (drive legacy call-state machine via ENCR) -----
     if func == 'D-SETUP':
         enc, enc_type, encr = _enc_pair_from_encr(fields)
         if encr == 0:
@@ -463,7 +462,6 @@ def parse_metadata_from_udp(data):
         return {"protocol": "TETRA", "type": "tx",
                 "ssi": ssi, "func": func}
 
-    # ----- Long-form FUNCs (additional fields, no ENCR) -----
     if func == 'NETINFO1':
         try: mcc = int(fields.get('MCC', '0'), 16)
         except ValueError: mcc = 0
@@ -610,6 +608,7 @@ def main():
     last_drop_log = [time.monotonic()]
     locked_tn = [-1]
     locked_tn_last_seen = [0.0]
+    codec_resets = [0]
 
     re_sync = re.compile(r'TN \d+\((\d+)\)')
     re_access_dl = re.compile(r'DL_USAGE:\s*(\S+)')
@@ -732,7 +731,7 @@ def main():
             enc_frame_index[0] += 1
             now = time.monotonic()
 
-            # Bug 14 — first-TN-wins lock
+            # Bug 14 — first-TN-wins lock with optional codec reset (Bug 14b)
             tn_says_drop = False
             if TETRA_TN_LOCK_TIMEOUT > 0 and frame_tn >= 0:
                 if (locked_tn[0] >= 0 and
@@ -742,6 +741,17 @@ def main():
                                    f'released TN={locked_tn[0]}'.encode(),
                                    max_bytes=32)
                     locked_tn[0] = -1
+                    if TETRA_RESET_CODEC_ON_UNLOCK:
+                        try:
+                            codec.stop()
+                            codec_resets[0] += 1
+                            if TETRA_DEBUG:
+                                debug_dump(
+                                    'codec_reset',
+                                    f'count={codec_resets[0]}'.encode(),
+                                    max_bytes=32)
+                        except Exception:
+                            pass
                 if locked_tn[0] < 0:
                     locked_tn[0] = frame_tn
                     if TETRA_DEBUG:
@@ -753,7 +763,6 @@ def main():
                 else:
                     tn_says_drop = True
 
-            # Bug 13 dormant statistical filter
             log_now = (TETRA_DEBUG and
                        (enc_frame_index[0] % TETRA_ENC_RATIO_LOG_EVERY) == 0)
             need_metric = TETRA_ENC_RATIO_THRESHOLD > 0
@@ -805,13 +814,14 @@ def main():
                 debug_dump(
                     'frame_stats',
                     ('fed={} dropped={} drop_tn={} drop_enc={} '
-                     'drop_no_call={} locked_tn={} fed_per_tn=[{}] '
-                     'drop_per_tn=[{}]').format(
+                     'drop_no_call={} locked_tn={} codec_resets={} '
+                     'fed_per_tn=[{}] drop_per_tn=[{}]').format(
                         fed_count[0], drop_count[0], drop_tn_count[0],
                         drop_enc_count[0], drop_no_call_count[0],
-                        locked_tn[0], fed_summary, drop_summary
+                        locked_tn[0], codec_resets[0],
+                        fed_summary, drop_summary
                     ).encode(),
-                    max_bytes=256)
+                    max_bytes=288)
                 last_drop_log[0] = now
 
     sock.close()
