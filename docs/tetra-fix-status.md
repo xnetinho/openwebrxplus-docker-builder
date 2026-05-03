@@ -1,7 +1,7 @@
 # TETRA Frequency Monitoring Branch — Status & Roadmap
 
 Branch: `claude/tetra-frequency-monitoring-3IqM9`
-Last updated: 2026-05-02 (session 7)
+Last updated: 2026-05-03 (session 8)
 
 Purpose: fix the TETRA decoder pipeline so the OpenWebRX+ panel matches
 reality and unencrypted voice traffic plays back as audio.
@@ -37,7 +37,8 @@ width varies (18..22 bytes) with the hex digit count of TRA/RX/DECR.
 Misalignment of 1–3 bytes shifted ACELP input and produced silence/noise.
 
 Fixed: `parse_audio_from_udp` uses `match.end()` of the regex to
-compute the binary payload offset dynamically.
+compute the binary payload offset dynamically. Superseded by Bug 14
+which moves to a fixed 32-byte header.
 
 ### Bug 4 — Codec patch keystream handling DOESN'T HELP (REVERTED — `b5e19e8`)
 
@@ -79,8 +80,11 @@ RX (NUL is not `\s`). Result: 0 ACELP frames extracted out of 450
 audio packets. Persistent silence even when network was clear.
 
 Fixed: unified `AUDIO_PATTERN` matches both formats:
-  - `TRA:HH RX:HH\x00`              (passthrough mode, what -e emitted)
-  - `TRA:HH RX:HH DECR:HH `         (standard mode)
+  - `TRA:HH RX:HH\x00`              (default upstream)
+  - `TRA:HH RX:HH DECR:HH `         (alt format)
+
+Subsequently extended in Bug 14 to also accept the patched
+32-byte format with `TN:N`.
 
 ### Bug 7 — Codec deadlocks the main loop (FIXED — `52d8833`)
 
@@ -103,48 +107,27 @@ Definitive fix found by comparing against the reference plugin
 `osmo-tetra-sq5bpf` binary, but our `tetra-rx` invocation was
 `-r -s -e /dev/stdin` while the reference uses just `-r -s /dev/stdin`.
 
-The `-e` flag puts `tetra-rx` in encrypted-passthrough mode:
-  - frames from encrypted calls are emitted instead of dropped,
-  - the audio header switches from `TRA:HH RX:HH DECR:HH ` (3 fields,
-    space-terminated) to `TRA:HH RX:HH\x00` (2 fields, NUL-terminated),
-  - the bytes after the header are PRE-deinterleave passthrough, NOT
-    fully decoded ACELP.
-
-With -e on a clear cell, the codec receives mis-interleaved bytes that
+The `-e` flag puts `tetra-rx` in encrypted-passthrough mode. With -e
+on a clear cell, the codec receives mis-interleaved bytes that
 periodically align by chance and produce ~300ms intelligible voice
-fragments alternating with ~60ms garbled in a loop — the exact
-symptom the user reported. Without -e:
-  - clear cells: proper DECR-decoded ACELP -> intelligible audio.
-  - encrypted cells: tetra-rx drops frames, audio stream at 0 kbps.
-    Panel still correctly shows `Cell Sec.: TEAn (SC N)`.
-
-The AUDIO_PATTERN regex still tolerates both formats so passing -e
-for diagnostics doesn't break parsing.
+fragments alternating with ~60ms garbled in a loop. Without -e:
+clear cells decode properly; encrypted bursts are dropped by the
+upstream binary.
 
 ### Bug 9 — `silence_20ms` padding inflated stream rate (FIXED — `365ec98`)
 
 Decoder injected 20ms of zeros to stdout every 20ms whenever no ACELP
 frame was available, making the OWRX+ Audio stream indicator oscillate
-at 10–15 kbps even with no call. DMR decoder shows 0 kbps in the same
-situation.
-
-Fixed: removed all silence padding. PCM is now written only when the
-codec produces a real frame. Matches DMR/NXDN/YSF behavior — stream
-is silent (no bytes) when there is no voice activity.
+at 10–15 kbps even with no call. Fixed: removed all silence padding.
+PCM is now written only when the codec produces a real frame.
 
 ### Bug 10 — Debug output swallowed by csdr_module_tetra (FIXED — `00c45c2`)
 
-`csdr_module_tetra._read_meta()` captures the decoder's stderr and
-filters non-JSON lines to `logger.debug()`, which never reaches
-docker logs unless the entire OWRX+ logger is in DEBUG mode. The
-original debug_dump() wrote to stderr and was therefore invisible.
+`csdr_module_tetra._read_meta()` filters non-JSON stderr to
+`logger.debug()`, invisible without DEBUG mode. Fixed: debug_dump
+writes to `/tmp/tetra-debug.log` (overridable via `TETRA_DEBUG_FILE`).
 
-Fixed: debug_dump now writes to a file (default `/tmp/tetra-debug.log`,
-overridable via `TETRA_DEBUG_FILE`). Line-buffered append. Always
-writes a startup banner regardless of TETRA_DEBUG, so users can
-verify the new code is actually running.
-
-### Bug 11 — Codec output mixed clear+scrambled (CONFIRMED IN PIPELINE; INITIAL DIAGNOSIS WRONG — `6ff2e36`)
+### Bug 11 — Codec output mixed clear+scrambled (REFRAMED — see Bug 14)
 
 Even after every fix above, on a TEA2-capable cell (391.525 MHz)
 with a clear call active, the user hears intelligible speech
@@ -152,78 +135,54 @@ intermixed with scrambled segments.
 
 Diagnostic step (`6ff2e36`): added `TETRA_PCM_DUMP=/path.raw` env var
 so every PCM chunk emitted by the codec is also appended to a raw
-file. User listened with `aplay -r 8000 -f S16_LE -c 1 ...` and in
-Audacity (Signed 16-bit PCM, LE, mono, 8 kHz).
-
-**Result confirmed by user (session 4)**: the offline `.raw` is
-*identical* to what the browser plays — clear voice mixed with
-scrambled segments. This **rules out** the OWRX+ post-processing
-chain (Opus encoder, resampler, WebSocket). The artefact is in our
-pipeline OR in osmo-tetra-sq5bpf upstream.
+file. User confirmed (session 4) the offline `.raw` is identical to
+what the browser plays — artefact is in our pipeline OR in
+osmo-tetra-sq5bpf upstream, not in OWRX+ post-processing.
 
 **Initial hypothesis (sessions 4–6, eventually disproven)**: TEA2
-encrypted bursts being decoded as garbled ACELP. Drove Bugs 12 and
-13 work.
+encrypted bursts being decoded as garbled ACELP. Drove Bug 12
+(signaling-gate) and Bug 13 (statistical-gate) work, both of which
+failed.
 
-**Revised hypothesis (session 7, see Bug 14)**: scrambled audio is
-not encryption — it's voice from MULTIPLE concurrent calls being
-interleaved into the same UDP stream by `tetra-rx`, then fed
-sequentially to a single codec instance.
+**Revised hypothesis (session 7, see Bug 14)**: voice from MULTIPLE
+concurrent calls / timeslots being interleaved into the same UDP
+stream by `tetra-rx`, then fed sequentially to a single codec
+instance. User narrative ("scrambled audio is the same clean voice
+played out of order, partially intelligible") is incompatible with
+encryption (which would be pure noise) and consistent with
+multi-source interleaving.
 
 ### Bug 12 — Active-clear-call filter (ATTEMPTED, FAILED — `f0ed4d2`)
 
 Hypothesis: gate codec input on a per-SSI clear-call state machine
-driven by short-form FUNC ENCR field. Track:
-
-  - `D-SETUP` / `D-CONNECT` with `ENCR:0`  → mark SSI clear.
-  - `D-SETUP` / `D-CONNECT` with `ENCR:1/2/3` → drop SSI from clear set.
-  - `D-RELEASE` or `D-TX CEASED` → drop SSI from clear set.
-  - 30 s stale timeout per SSI.
-
-Drop ACELP frames if no SSI is currently in the clear set
-(`TETRA_DROP_NO_CALL=1`, default; set to `0` to disable filter).
+driven by short-form FUNC ENCR field.
 
 **Result: total silence.** Log v4 (403 MB capture, session 5):
-
-```
-grep -E 'call_open_clear|call_release|call_drop_enc' tetra-debug.log
-   | wc -l                                        →  0
-grep 'frame_stats' tetra-debug.log | tail -1
-   →  fed=0 dropped=20278 active_clear=0
-grep -oE 'ENCR:[0-9]+' tetra-debug.log | wc -l   →  0
-```
-
-100% of voice frames dropped: no short-form FUNCs were emitted
-during the entire capture. The state machine never received a
-single transition.
-
-Conclusion (then): gate-by-ENCR is unworkable on this build.
-Filter remains in code but defaults off (`TETRA_DROP_NO_CALL=0`).
+20 278/20 278 voice frames dropped, zero `ENCR:` in 403 MB log.
+Short-form FUNCs are too sparse on this build. Filter remains in
+code but defaults off (`TETRA_DROP_NO_CALL=0`).
 
 ### Bug 13 — Statistical per-frame encryption detection (ABANDONED — sessions 6–7)
 
-Plan: gate codec input by a zlib-style entropy heuristic computed on
-each ACELP voice frame. Inspired by TetraEar's fallback layer
-(`unique_bytes/total > 0.7 → encrypted`).
+Plan: gate codec input by zlib-style entropy on each ACELP frame.
 
 #### Implementation iterations
 
 | Commit | Metric | Result |
 |---|---|---|
 | `6ebdd1a` | zlib over full 1380-byte frame | tight cluster ~0.11, no discrimination |
-| `97d9d34` | zlib over 690 sign bytes (high byte of int16) | tight cluster ~0.18, no discrimination |
-| `315e15d` | added bit-packed signs (87 bytes) and bit-flip rate | bit-packed ~0.78, flip ~0.33 — still tight clusters |
+| `97d9d34` | zlib over 690 sign bytes | tight cluster ~0.18, no discrimination |
+| `315e15d` | added bit-packed signs and bit-flip rate | bit-packed ~0.78, flip ~0.33 — still tight |
 | `6470d93` | restricted to 432 actual soft-bit positions (skip magic + filler) | bitsD ~1.18, flipD ~0.51 — random-looking, still tight |
 
 #### Why it fundamentally cannot work
 
-The 432 ACELP soft-bits emitted by tetra-rx are **post-Viterbi /
-post-FEC**. Modern speech codecs (ACELP) are designed so quantized
+The 432 ACELP soft-bits emitted by tetra-rx are post-Viterbi /
+post-FEC. Modern speech codecs (ACELP) are designed so quantized
 parameters approximate uniform random distribution at the bit level.
 Combined with FEC, the bit stream is already near-maximum-entropy.
-Adding TEA2/TEA3 encryption (XOR with keystream) on top of an
-already-random sequence preserves randomness — no measurable change
-in any single-frame statistic.
+TEA2 encryption (XOR with keystream) on top preserves randomness —
+no measurable change in any single-frame statistic.
 
 Calibration runs (140 frames session 6, 287 frames session 7) on
 captures with mixed clear+scrambled audio always produced a single
@@ -239,102 +198,130 @@ tight cluster on every metric tried:
 | bitsD | 1.164 | 1.200 | 1.199 | 0.036 |
 | flipD | 0.449 | 0.567 | 0.506 | 0.118 |
 
-`bitsD` ≈ 1.2 means zlib output exceeds input — the bit stream is
+`bitsD` ≈ 1.2 means zlib output exceeds input — bit stream is
 genuinely random. `flipD` ≈ 0.51 confirms ~50% bit-flip rate.
-Speech ACELP after Viterbi is statistically indistinguishable from
-random noise. **Option A is dead.** No per-frame statistical
-discriminator on the current passthrough format will work.
+**Option A is dead.** Metric infrastructure left in code as a
+debug surface, gated by `TETRA_ENC_RATIO_THRESHOLD=0` (off).
 
-The metric infrastructure (`_all_metrics`, the 7 candidate
-discriminators, `TETRA_ENC_METRIC` env, `TETRA_ENC_RATIO_THRESHOLD`)
-is left in the code as a debugging surface. With
-`TETRA_ENC_RATIO_THRESHOLD=0` (default), it is a no-op.
+### Bug 14 — Multiplexed concurrent-call interleaving (IMPLEMENTED — pending validation)
 
-### Bug 14 — Multiplexed concurrent-call interleaving (NEW HYPOTHESIS — session 7)
-
-User narrative (session 7, while listening live during a build):
+User narrative (session 7) ruled out the encryption hypothesis:
 
 > "o áudio embaralhado aparenta ser o mesmo áudio limpo mas reproduzido
 > de forma desordenada, pois em algumas escutas de áudio embaralho,
-> mesmo com dificuldade, é possível compreender o teor da conversa,
-> é como se os dados chegassem de forma desordenada e fossem
-> demodulados assim."
+> mesmo com dificuldade, é possível compreender o teor da conversa"
 
-(Translation: "the scrambled audio sounds like the same clean audio
-but reproduced in a disordered way; in some listens to scrambled
-audio, even with difficulty, it's possible to understand the content
-of the conversation; it's like the data is arriving out of order and
-being demodulated that way.")
+Evidence matrix:
 
-This is **not** encryption — it's **voice-stream multiplexing without
-demultiplexing**. Hypothesis:
-
-`tetra-rx` from `osmo-tetra-sq5bpf` decodes voice from **all four
-TETRA timeslots** that carry traffic, plus possibly multiple SSIs
-sharing the same TS over time, and emits all bursts to the same
-single UDP voice stream tagged only with `TRA:HH RX:HH DECR:%i\0`.
-The header has **no SSI, no TS, no call-id field** that would let
-us demultiplex. We feed everything into one cdecoder instance;
-the codec interprets sequential bursts as if they were one stream.
-
-When only one call is active → audio is intelligible (single source).
-When two or more calls are active concurrently → consecutive bursts
-belong to different speakers, codec state thrashes, audio sounds
-"scrambled" — but is actually two intelligible conversations
-super-imposed.
-
-Consistent with every observation:
-
-| Observation | Bug 11 (encryption) | Bug 14 (interleaving) |
+| Observation | Encrypted hypothesis | Interleaving hypothesis |
 |---|---|---|
 | `.raw` mixed clear/scrambled identical to browser | ✓ | ✓ |
 | Mixed segments are speech-shaped | ✓ | ✓ |
-| Bug 12 ENCR-gate dropped 100% of voice | ✗ unexpected | ✓ — D-SETUP rare regardless of clear/enc |
-| Bug 13 metrics show all frames look random | ✗ contradicts | ✓ — speech ACELP IS statistically random |
-| User can partially understand "scrambled" audio | ✗ should be pure noise if encrypted | ✓ — multiple intelligible streams overlapped |
-| Scrambled increases when base responds | ✗ unrelated | ✓ — second talker activates second SSI/TS |
-| Panel only shows TS1, but voice flows continuously | ✗ unexplained | ✓ — tetra-rx emits voice from all TS regardless of panel state |
+| Bug 12 ENCR-gate dropped 100% of voice | ✗ unexpected | ✓ — D-SETUP rare |
+| Bug 13 metrics show all frames look random | ✗ contradicts | ✓ — speech ACELP IS random |
+| User can partially understand "scrambled" audio | ✗ should be pure noise | ✓ — overlapped speech |
+| Scrambled increases when base responds | ✗ unrelated | ✓ — second SSI activates |
+| Panel only shows TS1, but voice flows continuously | ✗ unexplained | ✓ — tetra-rx emits all TS regardless |
 
-#### Why it's promising
+#### Decision: Option B (upstream patch, session 7)
 
-If true, the fix path is:
-  1. Patch upstream to include TS index and SSI in the voice header
-     (`TRA:HH RX:HH DECR:%i TS:%d SSI:%d\0`), OR equivalently emit
-     the voice via separate UDP ports per TS.
-  2. In `tetra_decoder.py`, demultiplex by TS/SSI: maintain one
-     `CodecPipeline` instance per active SSI, feed each its own
-     bursts.
-  3. Pick which decoded stream to forward to OWRX+ (e.g., the
-     longest-running, the one in the user-selected talkgroup, or
-     mix all PCM with averaging).
+User approved Option B: patch upstream `tetra_lower_mac.c` to add
+the timeslot number (TN) to the voice-frame header so the Python
+wrapper can demultiplex.
 
-Step 1 is essentially Option B from Bug 13 with a different field
-emitted — same upstream patch infrastructure.
+#### Upstream investigation (session 8)
 
-#### Why we couldn't see it before
+Read `osmo-tetra-sq5bpf/src/lower_mac/tetra_lower_mac.c` (the older
+repo our build clones — NOT `-sq5bpf-2`) via WebFetch. Confirmed:
 
-- Bug 11 hypothesis "encrypted bursts decoded as ACELP garbage"
-  fits the symptom equally well to a casual observer.
-- TetraEar focuses on encryption (it's the project's main feature)
-  so we mistakenly imitated their approach.
-- mbbrzoza reference plugin has the same problem but didn't document
-  the cause.
-- The TETRA cell at 391.525 happens to host a high-traffic talkgroup
-  (active QSO + base response), making interleaving frequent.
+  - The voice sprintf is in `tp_sap_udata_ind`, case `TPSAP_T_SCH_F`,
+    inside `if (tms->cur_burst.is_traffic)`.
+  - Original format: `sprintf(tmpstr,"TRA:%2.2x RX:%2.2x\0",...)` —
+    13-byte header (matches what user observed in v3 log).
+  - `tcd->time.tn` is in scope and contains the current TN (0..3).
+  - `tms->ssi` and `tms->tsn` do **not** exist in this repo's
+    `struct tetra_mac_state` (they exist in `-sq5bpf-2` only).
+    So we can demultiplex by TN, but not by SSI, without a deeper
+    refactor.
 
-#### Next diagnostic step
+#### Implementation
 
-Need a tcpdump-style capture to confirm whether tetra-rx multiplexes
-voice from multiple TS or SSIs into the same UDP stream. Concretely:
-add per-frame logging of `is_traffic` byte, plus byte-distribution
-fingerprint, plus inter-arrival time. If we see consecutive frames
-arriving with periodic patterns matching multiple interleaved
-sources (e.g., two distinct fingerprint clusters alternating every
-60 ms), Bug 14 is confirmed.
+Build-time patch (`a02be9b`): in `build-tetra-packages.sh`, after
+`git clone` we use `sed`+`perl` to rewrite three lines of
+`tetra_lower_mac.c`:
 
-Alternatively (faster path): patch upstream `tetra_lower_mac.c` to
-include TS in the voice header. Build, run, observe whether multiple
-TS values appear in voice frames during a "scrambled" listen.
+```c
+- unsigned char tmpstr[1380+13];
++ unsigned char tmpstr[1380+32];
+...
+- sprintf(tmpstr,"TRA:%2.2x RX:%2.2x\0",
+-     tms->cur_burst.is_traffic, tetra_hack_rxid);
+- memcpy(tmpstr+13, block, sizeof(block));
+- sendto(..., sizeof(block)+13, ...);
++ memset(tmpstr, 0, 32);
++ snprintf((char *)tmpstr, 32, "TRA:%2.2x RX:%2.2x TN:%i",
++     tms->cur_burst.is_traffic, tetra_hack_rxid, tcd->time.tn);
++ memcpy(tmpstr+32, block, sizeof(block));
++ sendto(..., sizeof(block)+32, ...);
+```
+
+Three post-patch `grep` assertions hard-fail the build if any of the
+three edits silently missed (e.g. upstream changed those lines).
+UDP voice packet size becomes 1412 bytes (was 1393).
+
+Python wrapper (`ae524aa`): `parse_audio_from_udp` returns
+`(tn, acelp_bytes)`. Reads the first 32 bytes as text (NUL-padded),
+extracts `TN:N`. Falls back to the legacy 13-byte regex when no
+TN found, returning `tn=-1` (so unpatched binaries still work).
+
+Main loop applies a "first-TN-wins" lock:
+
+  - When no TN is currently locked, the first voice frame's TN
+    claims the codec.
+  - Subsequent frames from other TNs are dropped (`drop_tn` counter).
+  - The lock auto-releases after `TETRA_TN_LOCK_TIMEOUT` seconds
+    (default 2.0) without renewal from the locked TN.
+  - Set `TETRA_TN_LOCK_TIMEOUT=0` to disable demux.
+
+Per-TN counters in `frame_stats` debug log let the user verify the
+hypothesis. If multiple TS are carrying voice we'll see e.g.
+`fed_per_tn=[tn1=120] drop_per_tn=[tn0=87 tn2=43]` — proving that
+without the lock those TS-1 / TS-3 bursts would have been
+interleaved into the codec.
+
+#### Validation plan
+
+User rebuilds image, runs with:
+
+```sh
+TETRA_DEBUG=1
+TETRA_DEBUG_FILE=/opt/owrx-docker/debug/tetra-debug.log
+TETRA_PCM_DUMP=/opt/owrx-docker/debug/tetra-pcm.raw
+```
+
+Listens for ~3 minutes covering both single-talker and
+multi-talker activity, then runs:
+
+```sh
+# UDP packet size: should now be 1412 (was 1393) on voice frames
+grep -oE 'len=14[01][0-9]' /opt/owrx-docker/debug/tetra-debug.log \
+  | sort | uniq -c
+
+# Per-TN frame distribution
+grep frame_stats /opt/owrx-docker/debug/tetra-debug.log | tail -10
+
+# TN lock acquisitions / releases
+grep -E 'tn_lock|tn_unlock' /opt/owrx-docker/debug/tetra-debug.log
+```
+
+Decision tree:
+  - Audio is now intelligible end-to-end: Bug 14 confirmed and fixed.
+  - Audio still scrambled, but `drop_per_tn` shows multiple TNs:
+    interleaving exists at SSI-within-TN level — need Bug 15
+    (per-SSI demux, requires `-sq5bpf-2` migration or deeper
+    upstream patch).
+  - Audio still scrambled, `fed_per_tn` only shows one TN: the root
+    cause is something else; revisit hypothesis.
 
 ---
 
@@ -362,6 +349,9 @@ TS values appear in voice frames during a "scrambled" listen.
 | `97d9d34` | `tetra_decoder.py` | Bug 13 attempt 2: zlib over sign bytes (no discrim) |
 | `315e15d` | `tetra_decoder.py` | Bug 13 attempt 3: 4 metrics in parallel (full/sign/bits/flip) |
 | `6470d93` | `tetra_decoder.py` | Bug 13 attempt 4: data-window metrics signD/bitsD/flipD (no discrim — Option A dead) |
+| `ce38fc8` | `docs/tetra-fix-status.md` | Register Bug 13 abandonment + Bug 14 hypothesis |
+| `a02be9b` | `build-tetra-packages.sh` | **Bug 14 patch**: upstream voice header gains TN field (32-byte fixed) |
+| `ae524aa` | `tetra_decoder.py` | **Bug 14 wrapper**: parse 32-byte header + first-TN-wins demux |
 
 ---
 
@@ -388,6 +378,18 @@ burst        timeslots{}, afc, burst_rate, call_type
 resource     func, ssi, idt, ssi2?
 ```
 
+Voice frame format on the wire (between patched tetra-rx and Python
+decoder, UDP loopback):
+
+```
+[32-byte ASCII header, NUL-padded] + [1380-byte ACELP soft-bit block]
+header text: "TRA:HH RX:HH TN:N\0"
+UDP packet size: 1412 bytes
+```
+
+Legacy 13-byte format still parsed for backward compatibility
+(returns `tn=-1`, no demux applied).
+
 ---
 
 ## Validation status
@@ -399,36 +401,32 @@ resource     func, ssi, idt, ssi2?
 | 0 ACELP frames extracted | -> ACELP extraction working | YES (in dump after `b47abd1`) |
 | Panel freezes on first ACELP | -> panel keeps updating | YES (`52d8833`) |
 | Periodic 300ms-intelligible voice | -> still mixed clear+scrambled | NO — see Bug 14 |
-| TEA1 false positive on clear calls | -> ENCR-derived encryption | superseded — ENCC doesn't exist on this build |
+| TEA1 false positive on clear calls | -> ENCR-derived encryption | superseded |
 | Mixed clear+scrambled audio in browser | -> still mixed offline (`.raw` confirms) | confirmed in pipeline |
-| `TETRA_DROP_NO_CALL=1` filters encrypted | -> total silence (Bug 12) | filter unusable on this build |
+| `TETRA_DROP_NO_CALL=1` filters encrypted | -> total silence (Bug 12) | filter unusable |
 | Bug 13 statistical filter discriminates | -> all 7 metrics show single tight cluster | Option A dead |
+| Bug 14 TN demux eliminates cross-talk | pending user validation | OPEN |
 
 ---
 
 ## Open work
 
-### Bug 14 — Demultiplex voice by TS/SSI (next decision point)
+### Bug 14 validation (next)
 
-Two sub-options, equivalent to Bug 13 A/B but for a different field:
+User to rebuild image with commits `a02be9b` + `ae524aa`, capture
+~3 minutes of mixed-talker activity, and report:
 
-- **A (Python-only)**: read each frame's TRA/RX bytes plus a
-  byte-distribution fingerprint of the soft-bit window, cluster
-  consecutive frames by similarity, route to per-cluster codec
-  instances. Brittle and may need tuning. Zero rebuild cost.
+  - Voice UDP packet size = 1412 (proving the C patch took effect).
+  - `frame_stats` per-TN counters: are multiple TNs being seen?
+  - Audio intelligibility end-to-end with default
+    `TETRA_TN_LOCK_TIMEOUT=2.0`.
 
-- **B (upstream patch)**: modify
-  `osmo-tetra-sq5bpf-2/src/lower_mac/tetra_lower_mac.c` so the voice
-  header includes TS and SSI:
-  ```c
-  sprintf(tmpstr,"TRA:%2.2x RX:%2.2x DECR:%i TS:%d SSI:%d\0",
-          tms->cur_burst.is_traffic, tetra_hack_rxid, decrypted,
-          tms->cur_ts, tms->cur_call_ssi);
-  ```
-  Recompile, update Python parser to read TS/SSI, demux to per-SSI
-  codec instances. Single source of truth. Confirmed needed if
-  Option A from this bug doesn't work. Same rebuild cost as Bug 13's
-  Option B (which was never triggered).
+Outcomes:
+  - **Fixed**: close Bug 14, move on to frontend / cosmetic items.
+  - **Better but residual scramble**: open Bug 15 (per-SSI demux,
+    requires migrating to `osmo-tetra-sq5bpf-2` which exposes
+    `tms->ssi` in `struct tetra_mac_state`).
+  - **Unchanged**: revisit hypothesis with new data.
 
 ### Frontend: SCK-locked badge state (defer)
 
@@ -454,7 +452,7 @@ No public dictionary; needs operator contact or empirical mapping.
 
 ### TS slot stale state (cosmetic)
 
-Soft 30s timeout to clear `call_setup` slots when no matching
+Soft 30 s timeout to clear `call_setup` slots when no matching
 `call_release` arrives.
 
 ### Frequency offset (separate bug, defer)
@@ -476,13 +474,13 @@ Same `osmo-tetra-sq5bpf` upstream + ETSI codec. Diffs after our fixes:
 |---|---|---|
 | `tetra-rx` flags | `-r -s` | `-r -s` (after `fec8ff9`) |
 | Codec patch | bundled osmo-tetra-sq5bpf | bundled (after `b5e19e8`) |
-| Builds float_to_bits | yes (unused at runtime) | no (not needed) |
 | Codec call style | synchronous | async via reader thread |
 | Silence padding | yes (legacy) | removed (`365ec98`) |
 | Debug dumps | none | TETRA_DEBUG=1 -> file |
 | Encryption source | Basicinfo low nibble | ENCR (short-form FUNC) |
 | Cell-cap vs call-enc | merged | separated (`Cell Sec.` row) |
-| Mixed audio on busy cell | same problem (untested) | same problem — see Bug 14 |
+| Voice-stream demux | none | first-TN-wins (Bug 14) |
+| Mixed audio on busy cell | same problem | should be fixed pending validation |
 
 ### aruznieto/TetraEar (session 6)
 
@@ -494,13 +492,7 @@ Pure-Python TETRA decoder (does NOT use osmo-tetra). Relevant bits:
 | Encryption detection | MAC header 2-bit field + entropy fallback + call-meta override + SDS heuristic | Tried both — neither works on osmo-tetra passthrough format |
 | Codec format | builds 690 × int16 soft-bits, header `0x6B21` | tetra-rx already emits this format (verified via log v3) |
 | Auto-decrypt | yes (loads keys from `keys.txt`) | no key loaded; encrypted bursts pass through as garbage |
-| Per-TS / per-SSI demux | full TETRA stack — implicit | currently single codec instance for all bursts (Bug 14) |
-
-TetraEar's MAC-layer parsing was useful to confirm encryption_mode is
-exposable from a fork of osmo-tetra (Bug 13 / Bug 14 Option B). Its
-entropy fallback validated the *idea* of statistical detection but
-operates on raw MAC PDU bytes; we operate on post-Viterbi soft-bits
-where the metric signal collapses (Bug 13 lesson).
+| Per-TS / per-SSI demux | full TETRA stack — implicit | per-TN (Bug 14); per-SSI deferred to Bug 15 if needed |
 
 ---
 
@@ -511,5 +503,6 @@ where the metric signal collapses (Bug 13 lesson).
 - **Session 3**: Bug 8 (`-e` flag) fixed; PCM-dump diagnostic step added (Bug 11 isolation).
 - **Session 4**: User confirmed offline `.raw` is identical to browser audio → artefact is in pipeline (not OWRX+ chain). Log v3 analysis: ENCC absent, ENCR present (79 events all `ENCR:0`). Bug 12 implemented (`f0ed4d2`).
 - **Session 5**: Log v4 analysis: 0 ENCR fields in 403 MB capture, 100% frame drop, total silence — Bug 12 unusable. Upstream confirms no encryption flag in passthrough header beyond `DECR`. Bug 13 opened with 3 options.
-- **Session 6**: TetraEar inspection. User approved Option A. Implemented zlib(full) and zlib(signs); both showed single-cluster ratios (~0.11, ~0.18) on 140 mixed-audio frames. Added bit-packed signs and flip rate; still single clusters.
-- **Session 7**: Restricted metrics to the 432-position soft-bit window (skip magic + filler). bitsD ≈ 1.2 (no compression possible) and flipD ≈ 0.51 (random) prove ACELP soft-bits are statistically random regardless of clear/encrypted. **Option A formally abandoned.** User reported live observation: scrambled audio is intelligible but disordered, suggesting **interleaved concurrent calls** (Bug 14) rather than encrypted content. Hypothesis fits all observations (Bug 11 narrative, Bug 12 silence, Bug 13 random metrics). Pending decision Bug 14 A/B.
+- **Session 6**: TetraEar inspection. User approved Option A. Implemented zlib(full) and zlib(signs); both showed single-cluster ratios on 140 mixed-audio frames. Added bit-packed signs and flip rate; still single clusters.
+- **Session 7**: Restricted metrics to the 432-position soft-bit window (skip magic + filler). bitsD ≈ 1.2 (no compression possible) and flipD ≈ 0.51 (random) prove ACELP soft-bits are statistically random regardless of clear/encrypted. **Option A formally abandoned.** User reported live observation: scrambled audio is intelligible but disordered, suggesting **interleaved concurrent calls** (Bug 14) rather than encrypted content. User approved Option B (upstream patch).
+- **Session 8**: WebFetch on `osmo-tetra-sq5bpf` (note: NOT `-sq5bpf-2`, the older repo our build uses) confirmed the C patch design — `tcd->time.tn` is accessible at the voice sprintf, but `tms->ssi` is not (only in `-sq5bpf-2`). Implemented the upstream patch via build-script `sed`+`perl` (`a02be9b`) and the Python parser + first-TN-wins demux (`ae524aa`). Validation pending.
