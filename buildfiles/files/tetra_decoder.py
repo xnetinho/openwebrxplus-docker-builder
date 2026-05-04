@@ -5,64 +5,64 @@ Reads complex float IQ from stdin (36 kS/s, centered on TETRA carrier).
 Writes PCM audio to stdout (8 kHz, 16-bit signed LE, mono).
 Writes JSON metadata to stderr (TETMON signaling: network info, calls).
 
-Per-SSI voice demultiplexing (Bug 15):
+Per-call voice demultiplexing (Bug 15 round 2):
   Patched upstream `osmo-tetra-sq5bpf-2` (see build-tetra-packages.sh)
-  emits voice frames with a 64-byte header carrying TRA, RX, DECR,
-  TN (timeslot 1..4), SSI (caller) and TSN (slot number).
+  emits voice frames with a 64-byte header carrying:
+    - TRA  (is_traffic flag)
+    - RX   (rxid, fixed)
+    - DECR (decryption success)
+    - TN   (timeslot 1..4)
+    - SSI  (MAC RESOURCE address — destination, may be 0xFFFFFF=ALL-CALL)
+    - TSN  (slot number)
+    - UM   (usage_marker — per-call channel identifier from upper MAC)
 
-  This wrapper parses SSI and applies a "first-SSI-wins" lock: the
-  first non-zero SSI claims the codec; subsequent frames from other
-  SSIs are dropped until the locked SSI goes silent for
-  `TETRA_SSI_LOCK_TIMEOUT` seconds. This is the per-talker analog
-  of Bug 14's TN-lock and supersedes it for the common case where
-  multiple SSIs share the same TN via PTT handoff.
+  Demux uses a layered "first-key-wins" lock with priority:
+    1. UM > 0          (most specific — per-call channel identifier)
+    2. SSI > 0 AND SSI != 0xFFFFFF   (real subscriber/group SSI)
+    3. TN >= 0         (fallback — timeslot grouping)
+    4. otherwise no demux (pass through).
 
-  Fallback chain:
-    - If SSI > 0 in header: SSI-lock active.
-    - If SSI == 0 (legacy / unknown): fall back to TN-lock.
-    - If neither field present (legacy 13/20/32-byte header): no
-      demux applied (legacy unpatched binary).
+  When a frame arrives, the lock-key is computed by this priority and
+  matched against the currently locked key. Cross-key frames are
+  dropped until silence > TETRA_LOCK_TIMEOUT seconds.
 
-Codec reset on unlock (Bug 14b) — disabled by default after
-calibration showed it caused audible glitches without improving
-intelligibility. Enable via `TETRA_RESET_CODEC_ON_UNLOCK=1`.
+  Background:
+  - Session 8: TN-lock alone catches cross-TN cross-talk (~8% of frames)
+    but multi-talker on same TN passes through.
+  - Session 9: SSI-lock revealed 96% of voice frames have SSI=0xFFFFFF
+    (ALL-CALL destination per ETSI EN 300 392-2) on this network.
+    Caller-side info needs another field.
+  - Round 2: UM (usage_marker) added to provide caller-side
+    discrimination while keeping SSI/TN as fallback.
 
-Frame-level statistical filter (Bug 13, Option A — abandoned, kept
-as debug surface): per-frame zlib / flip-rate metrics computed only
-when `TETRA_ENC_RATIO_THRESHOLD > 0`. Default 0 = no filtering.
+Codec reset on unlock (Bug 14b): disabled by default after calibration
+showed it caused glitches. Enable via `TETRA_RESET_CODEC_ON_UNLOCK=1`.
+
+Frame-level statistical filter (Bug 13, abandoned): metric infrastructure
+kept as debug surface. Off when `TETRA_ENC_RATIO_THRESHOLD=0`.
 
 Debug:
-  TETRA_DEBUG=1                  -> dumps to /tmp/tetra-debug.log
-                                    (override path with TETRA_DEBUG_FILE).
+  TETRA_DEBUG=1                  -> dumps to /tmp/tetra-debug.log.
   TETRA_PCM_DUMP=/path.raw       -> appends each PCM chunk to file.
-  TETRA_SSI_LOCK_TIMEOUT=2.0     -> seconds of silence on locked SSI
-                                    before another SSI can claim the
-                                    codec. Set 0 to disable SSI lock.
-  TETRA_TN_LOCK_TIMEOUT=2.0      -> fallback TN lock when SSI absent.
-                                    Set 0 to disable.
+  TETRA_LOCK_TIMEOUT=2.0         -> seconds of silence on the locked key
+                                    before another key can claim the
+                                    codec. Set 0 to disable demux entirely.
+                                    (Replaces the older TETRA_SSI_LOCK_TIMEOUT
+                                    / TETRA_TN_LOCK_TIMEOUT envs; kept as
+                                    aliases for backward compat.)
   TETRA_RESET_CODEC_ON_UNLOCK=0  -> kill+restart codec on unlock.
-                                    Default off; enabling caused
-                                    glitches in practice.
+                                    Default off.
   TETRA_ENC_METRIC=bitsD         -> Bug 13 statistical metric (debug).
   TETRA_ENC_RATIO_THRESHOLD=0    -> drop frames whose chosen metric
                                     exceeds threshold (0 = off).
   TETRA_DROP_NO_CALL=0           -> legacy clear-call filter (off).
 
-Voice frame format (after Bug 15 upstream patch):
+Voice frame format (after Bug 15 round 2 upstream patch):
   64-byte ASCII header (NUL-padded after the snprintf text) plus
   1380-byte ACELP soft-bit block. UDP packet = 1444 bytes total.
-  Header text: `TRA:HH RX:HH DECR:N TN:N SSI:N TSN:N\\0`.
-  Older formats (Bug 14 v32-byte, legacy v13/v20) still parse for
-  backward compat (returns ssi=-1, tsn=-1 when fields absent).
-
-Block layout (1380 bytes = 690 × int16 LE soft-bits):
-  positions 0/115/230/345 = magic / gap markers
-  positions 1..114, 116..229, 231..344, 346..435 = 432 soft-bits
-  positions 436..689 = zero filler
-
-Codec pipeline is async: feeding ACELP into cdecoder.stdin never blocks
-the main loop. A dedicated reader thread pulls PCM from sdecoder.stdout
-and writes it to sys.stdout.
+  Header text: "TRA:HH RX:HH DECR:N TN:N SSI:N TSN:N UM:N\\0".
+  Older formats (Bug 15 round 1 v64-byte without UM, Bug 14 v32-byte,
+  legacy v13/v20) still parse with the missing fields = -1.
 """
 
 import datetime
@@ -86,14 +86,17 @@ try:
     TETRA_ENC_RATIO_THRESHOLD = float(os.environ.get("TETRA_ENC_RATIO_THRESHOLD", "0"))
 except ValueError:
     TETRA_ENC_RATIO_THRESHOLD = 0.0
-try:
-    TETRA_TN_LOCK_TIMEOUT = float(os.environ.get("TETRA_TN_LOCK_TIMEOUT", "2.0"))
-except ValueError:
-    TETRA_TN_LOCK_TIMEOUT = 2.0
-try:
-    TETRA_SSI_LOCK_TIMEOUT = float(os.environ.get("TETRA_SSI_LOCK_TIMEOUT", "2.0"))
-except ValueError:
-    TETRA_SSI_LOCK_TIMEOUT = 2.0
+def _env_float(name, default):
+    try:
+        return float(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+# Unified lock timeout. Reads TETRA_LOCK_TIMEOUT, falls back to the
+# older SSI/TN names if those are set explicitly.
+TETRA_LOCK_TIMEOUT = _env_float(
+    "TETRA_LOCK_TIMEOUT",
+    _env_float("TETRA_SSI_LOCK_TIMEOUT",
+               _env_float("TETRA_TN_LOCK_TIMEOUT", 2.0)))
 TETRA_RESET_CODEC_ON_UNLOCK = os.environ.get("TETRA_RESET_CODEC_ON_UNLOCK", "0") == "1"
 _VALID_METRICS = ("full", "sign", "bits", "flip", "signD", "bitsD", "flipD")
 TETRA_ENC_METRIC = os.environ.get("TETRA_ENC_METRIC", "bitsD")
@@ -103,16 +106,19 @@ TETRA_ENC_RATIO_LOG_EVERY = 10  # log all metrics every Nth voice frame
 
 ACELP_FRAME_SIZE = 1380
 PCM_OUTPUT_BYTES = 960
-CALL_STALE_TIMEOUT = 30.0  # seconds without renewal -> drop SSI from clear set
+CALL_STALE_TIMEOUT = 30.0
 
-# Header sizes for the various upstream variants we accept.
-HEADER_SIZE_BUG15 = 64    # patched sq5bpf-2: TRA RX DECR TN SSI TSN
+HEADER_SIZE_BUG15 = 64    # patched sq5bpf-2: TRA RX DECR TN SSI TSN [UM]
 HEADER_SIZE_BUG14 = 32    # patched sq5bpf:   TRA RX TN
-HEADER_SIZE_LEGACY = 13   # original sq5bpf:  TRA RX
+HEADER_SIZE_LEGACY = 13
 
 # Soft-bit window in the cdecoder frame (skip magic + filler).
 SOFT_BIT_BYTES_START = 2
 SOFT_BIT_BYTES_END = 872
+
+# SSI=0xFFFFFF is the TETRA ALL-CALL broadcast destination address per
+# ETSI EN 300 392-2. Useless as a per-talker discriminator.
+SSI_BROADCAST = 0xFFFFFF
 
 # Legacy variable-length header pattern (still accepted as fallback).
 AUDIO_PATTERN_LEGACY = re.compile(
@@ -125,14 +131,13 @@ try:
     _DEBUG_FH = open(TETRA_DEBUG_FILE, 'a', buffering=1)
     _DEBUG_FH.write(
         '\n=== tetra_decoder.py startup at {} | TETRA_DEBUG={} | PCM_DUMP={} | '
-        'DROP_NO_CALL={} | SSI_LOCK_TIMEOUT={} | TN_LOCK_TIMEOUT={} | '
-        'RESET_ON_UNLOCK={} | ENC_METRIC={} | ENC_RATIO_THRESHOLD={} ===\n'.format(
+        'DROP_NO_CALL={} | LOCK_TIMEOUT={} | RESET_ON_UNLOCK={} | '
+        'ENC_METRIC={} | ENC_RATIO_THRESHOLD={} ===\n'.format(
             datetime.datetime.now().isoformat(timespec='seconds'),
             'on' if TETRA_DEBUG else 'off',
             TETRA_PCM_DUMP or 'off',
             'on' if TETRA_DROP_NO_CALL else 'off',
-            TETRA_SSI_LOCK_TIMEOUT if TETRA_SSI_LOCK_TIMEOUT > 0 else 'off',
-            TETRA_TN_LOCK_TIMEOUT if TETRA_TN_LOCK_TIMEOUT > 0 else 'off',
+            TETRA_LOCK_TIMEOUT if TETRA_LOCK_TIMEOUT > 0 else 'off',
             'on' if TETRA_RESET_CODEC_ON_UNLOCK else 'off',
             TETRA_ENC_METRIC,
             TETRA_ENC_RATIO_THRESHOLD if TETRA_ENC_RATIO_THRESHOLD > 0 else 'off'))
@@ -372,8 +377,8 @@ def find_free_port():
 
 
 def _parse_voice_header(header_bytes):
-    """Return dict {tn, ssi, tsn, decr} extracted from the ASCII header.
-    Missing fields = -1. Returns None if no TRA: marker found.
+    """Return dict {tn, ssi, tsn, decr, um} extracted from the ASCII header.
+    Missing fields = -1. Returns None if no TRA: marker.
     """
     nul_pos = header_bytes.find(b'\x00')
     text_end = nul_pos if nul_pos >= 0 else len(header_bytes)
@@ -383,12 +388,13 @@ def _parse_voice_header(header_bytes):
         return None
     if 'TRA:' not in text:
         return None
-    out = {'tn': -1, 'ssi': -1, 'tsn': -1, 'decr': -1}
+    out = {'tn': -1, 'ssi': -1, 'tsn': -1, 'decr': -1, 'um': -1}
     for key, regex in (
             ('tn',   r'TN:(\d+)'),
             ('ssi',  r'SSI:(\d+)'),
             ('tsn',  r'TSN:(\d+)'),
-            ('decr', r'DECR:(\d+)')):
+            ('decr', r'DECR:(\d+)'),
+            ('um',   r'UM:(-?\d+)')):
         m = re.search(regex, text)
         if m:
             try: out[key] = int(m.group(1))
@@ -400,38 +406,55 @@ def parse_audio_from_udp(data):
     """Parse a TETMON voice UDP packet.
 
     Returns (meta_dict, acelp_bytes) or None.
-    meta_dict = {tn, ssi, tsn, decr}, with -1 for missing fields.
+    meta_dict = {tn, ssi, tsn, decr, um}, with -1 for missing fields.
     """
     tra_pos = data.find(b'TRA:')
     if tra_pos < 0:
         return None
     payload = data[tra_pos:]
 
-    # Try the new 64-byte format first (Bug 15 patched sq5bpf-2).
     if len(payload) >= HEADER_SIZE_BUG15 + ACELP_FRAME_SIZE:
         meta = _parse_voice_header(payload[:HEADER_SIZE_BUG15])
-        if meta and meta['ssi'] >= 0:
+        if meta and (meta['ssi'] >= 0 or meta['um'] >= 0):
             return (meta, payload[HEADER_SIZE_BUG15:HEADER_SIZE_BUG15 + ACELP_FRAME_SIZE])
 
-    # Fall back to the 32-byte format (Bug 14 patched sq5bpf with TN only).
     if len(payload) >= HEADER_SIZE_BUG14 + ACELP_FRAME_SIZE:
         meta = _parse_voice_header(payload[:HEADER_SIZE_BUG14])
         if meta and meta['tn'] >= 0:
             return (meta, payload[HEADER_SIZE_BUG14:HEADER_SIZE_BUG14 + ACELP_FRAME_SIZE])
 
-    # Fall back to the legacy variable-length header (unpatched binaries).
     match = AUDIO_PATTERN_LEGACY.match(payload)
     if match is None:
         return None
     offset = match.end()
     if len(payload) < offset + ACELP_FRAME_SIZE:
         return None
-    meta = {'tn': -1, 'ssi': -1, 'tsn': -1, 'decr': -1}
+    meta = {'tn': -1, 'ssi': -1, 'tsn': -1, 'decr': -1, 'um': -1}
     return (meta, payload[offset:offset + ACELP_FRAME_SIZE])
 
 
+def _frame_lock_key(meta):
+    """Return the best lock key for this voice frame, or None.
+
+    Priority:
+      1. UM > 0  (per-call channel marker — caller-side info)
+      2. SSI > 0 AND SSI != 0xFFFFFF (real subscriber/group SSI)
+      3. TN >= 0 (timeslot fallback)
+      None when no useful key is present.
+    """
+    um  = meta.get('um',  -1)
+    ssi = meta.get('ssi', -1)
+    tn  = meta.get('tn',  -1)
+    if um > 0:
+        return ('um', um)
+    if ssi > 0 and ssi != SSI_BROADCAST:
+        return ('ssi', ssi)
+    if tn >= 0:
+        return ('tn', tn)
+    return None
+
+
 def _enc_pair_from_encr(fields):
-    """ENCR:N is the encryption indicator on short-form FUNCs."""
     try:
         encr = int(fields.get('ENCR', '0'))
     except ValueError:
@@ -464,20 +487,16 @@ def parse_metadata_from_udp(data):
 
     if func == 'D-SETUP':
         enc, enc_type, encr = _enc_pair_from_encr(fields)
-        if encr == 0:
-            _mark_clear(ssi)
-        else:
-            _mark_encrypted(ssi)
+        if encr == 0: _mark_clear(ssi)
+        else:         _mark_encrypted(ssi)
         return {"protocol": "TETRA", "type": "call_setup",
                 "ssi": ssi, "encr": encr, "encrypted": enc,
                 "encryption_type": enc_type}
 
     if func == 'D-CONNECT':
         enc, enc_type, encr = _enc_pair_from_encr(fields)
-        if encr == 0:
-            _mark_clear(ssi)
-        else:
-            _mark_encrypted(ssi)
+        if encr == 0: _mark_clear(ssi)
+        else:         _mark_encrypted(ssi)
         return {"protocol": "TETRA", "type": "call_connect",
                 "ssi": ssi, "encr": encr, "encrypted": enc,
                 "encryption_type": enc_type}
@@ -630,19 +649,18 @@ def main():
     drop_count = [0]
     drop_no_call_count = [0]
     drop_enc_count = [0]
-    drop_ssi_count = [0]
-    drop_tn_count = [0]
+    drop_lock_count = [0]
     fed_count = [0]
+    fed_per_um = {}
     fed_per_ssi = {}
     fed_per_tn = {}
+    drop_per_um = {}
     drop_per_ssi = {}
     drop_per_tn = {}
     enc_frame_index = [0]
     last_drop_log = [time.monotonic()]
-    locked_ssi = [-1]
-    locked_ssi_last_seen = [0.0]
-    locked_tn = [-1]
-    locked_tn_last_seen = [0.0]
+    locked_key = [None]   # ('um', N) | ('ssi', N) | ('tn', N) | None
+    locked_key_last_seen = [0.0]
     codec_resets = [0]
 
     re_sync = re.compile(r'TN \d+\((\d+)\)')
@@ -770,57 +788,40 @@ def main():
         parsed = parse_audio_from_udp(data)
         if parsed is not None:
             voice_meta, acelp_data = parsed
-            frame_tn  = voice_meta['tn']
-            frame_ssi = voice_meta['ssi']
+            frame_um  = voice_meta.get('um', -1)
+            frame_ssi = voice_meta.get('ssi', -1)
+            frame_tn  = voice_meta.get('tn', -1)
             debug_dump('acelp', acelp_data, max_bytes=32)
             enc_frame_index[0] += 1
             now = time.monotonic()
 
-            # ───── Bug 15: SSI lock (primary) ─────────────────────────
-            ssi_says_drop = False
-            using_ssi_lock = (TETRA_SSI_LOCK_TIMEOUT > 0 and frame_ssi > 0)
-            if using_ssi_lock:
-                if (locked_ssi[0] > 0 and
-                        now - locked_ssi_last_seen[0] > TETRA_SSI_LOCK_TIMEOUT):
-                    if TETRA_DEBUG:
-                        debug_dump('ssi_unlock',
-                                   f'released SSI={locked_ssi[0]}'.encode(),
-                                   max_bytes=32)
-                    locked_ssi[0] = -1
-                    _maybe_reset_codec()
-                if locked_ssi[0] <= 0:
-                    locked_ssi[0] = frame_ssi
-                    if TETRA_DEBUG:
-                        debug_dump('ssi_lock',
-                                   f'acquired SSI={frame_ssi} TN={frame_tn}'.encode(),
-                                   max_bytes=64)
-                if frame_ssi == locked_ssi[0]:
-                    locked_ssi_last_seen[0] = now
-                else:
-                    ssi_says_drop = True
+            # ───── Bug 15 round 2: unified UM > SSI > TN lock ─────────
+            lock_says_drop = False
+            frame_key = _frame_lock_key(voice_meta)
 
-            # ───── Bug 14: TN lock (fallback when SSI unavailable) ────
-            tn_says_drop = False
-            if (not using_ssi_lock and
-                    TETRA_TN_LOCK_TIMEOUT > 0 and frame_tn >= 0):
-                if (locked_tn[0] >= 0 and
-                        now - locked_tn_last_seen[0] > TETRA_TN_LOCK_TIMEOUT):
+            if TETRA_LOCK_TIMEOUT > 0 and frame_key is not None:
+                if (locked_key[0] is not None and
+                        now - locked_key_last_seen[0] > TETRA_LOCK_TIMEOUT):
                     if TETRA_DEBUG:
-                        debug_dump('tn_unlock',
-                                   f'released TN={locked_tn[0]}'.encode(),
-                                   max_bytes=32)
-                    locked_tn[0] = -1
+                        kind, val = locked_key[0]
+                        debug_dump('lock_release',
+                                   f'kind={kind} val={val}'.encode(),
+                                   max_bytes=48)
+                    locked_key[0] = None
                     _maybe_reset_codec()
-                if locked_tn[0] < 0:
-                    locked_tn[0] = frame_tn
+                if locked_key[0] is None:
+                    locked_key[0] = frame_key
                     if TETRA_DEBUG:
-                        debug_dump('tn_lock',
-                                   f'acquired TN={frame_tn}'.encode(),
-                                   max_bytes=32)
-                if frame_tn == locked_tn[0]:
-                    locked_tn_last_seen[0] = now
+                        kind, val = frame_key
+                        debug_dump(
+                            'lock_acquire',
+                            f'kind={kind} val={val} um={frame_um} '
+                            f'ssi={frame_ssi} tn={frame_tn}'.encode(),
+                            max_bytes=80)
+                if locked_key[0] == frame_key:
+                    locked_key_last_seen[0] = now
                 else:
-                    tn_says_drop = True
+                    lock_says_drop = True
 
             # ───── Bug 13 dormant statistical filter ──────────────────
             log_now = (TETRA_DEBUG and
@@ -835,33 +836,34 @@ def main():
                 TETRA_DROP_NO_CALL and not _has_active_clear_call())
 
             if log_now and metrics is not None:
+                lk = locked_key[0] if locked_key[0] is not None else ('none', 0)
                 debug_dump(
                     'enc_ratio',
-                    ('frame={} ssi={} tn={} locked_ssi={} locked_tn={} '
+                    ('frame={} um={} ssi={} tn={} locked={}={} '
                      'full={:.3f} sign={:.3f} bits={:.3f} flip={:.3f} '
                      'signD={:.3f} bitsD={:.3f} flipD={:.3f} '
-                     'active={} thr={:.3f} drop_ssi={} drop_tn={} '
-                     'drop_ratio={} drop_no_call={}').format(
-                        enc_frame_index[0], frame_ssi, frame_tn,
-                        locked_ssi[0], locked_tn[0],
+                     'active={} thr={:.3f} drop_lock={} drop_ratio={} '
+                     'drop_no_call={}').format(
+                        enc_frame_index[0], frame_um, frame_ssi, frame_tn,
+                        lk[0], lk[1],
                         metrics['full'], metrics['sign'],
                         metrics['bits'], metrics['flip'],
                         metrics['signD'], metrics['bitsD'], metrics['flipD'],
                         TETRA_ENC_METRIC, TETRA_ENC_RATIO_THRESHOLD,
-                        int(ssi_says_drop), int(tn_says_drop),
-                        int(ratio_says_drop), int(no_call_says_drop)
+                        int(lock_says_drop), int(ratio_says_drop),
+                        int(no_call_says_drop)
                     ).encode(),
-                    max_bytes=400)
+                    max_bytes=420)
 
-            if ssi_says_drop:
-                drop_ssi_count[0] += 1
+            if lock_says_drop:
+                drop_lock_count[0] += 1
                 drop_count[0] += 1
+                if frame_um > 0:
+                    drop_per_um[frame_um] = drop_per_um.get(frame_um, 0) + 1
                 if frame_ssi > 0:
                     drop_per_ssi[frame_ssi] = drop_per_ssi.get(frame_ssi, 0) + 1
-            elif tn_says_drop:
-                drop_tn_count[0] += 1
-                drop_count[0] += 1
-                drop_per_tn[frame_tn] = drop_per_tn.get(frame_tn, 0) + 1
+                if frame_tn >= 0:
+                    drop_per_tn[frame_tn] = drop_per_tn.get(frame_tn, 0) + 1
             elif ratio_says_drop:
                 drop_enc_count[0] += 1
                 drop_count[0] += 1
@@ -870,6 +872,8 @@ def main():
                 drop_count[0] += 1
             else:
                 fed_count[0] += 1
+                if frame_um > 0:
+                    fed_per_um[frame_um] = fed_per_um.get(frame_um, 0) + 1
                 if frame_ssi > 0:
                     fed_per_ssi[frame_ssi] = fed_per_ssi.get(frame_ssi, 0) + 1
                 if frame_tn >= 0:
@@ -877,29 +881,27 @@ def main():
                 codec.feed(acelp_data)
 
             if TETRA_DEBUG and now - last_drop_log[0] >= 5.0:
-                ssi_top = ' '.join(
-                    f'ssi{k}={v}' for k, v in
-                    sorted(fed_per_ssi.items(), key=lambda kv: -kv[1])[:5])
-                tn_top = ' '.join(
-                    f'tn{k}={v}' for k, v in sorted(fed_per_tn.items()))
-                drop_ssi_top = ' '.join(
-                    f'ssi{k}={v}' for k, v in
-                    sorted(drop_per_ssi.items(), key=lambda kv: -kv[1])[:5])
-                drop_tn_top = ' '.join(
-                    f'tn{k}={v}' for k, v in sorted(drop_per_tn.items()))
+                def _top5(d, prefix):
+                    items = sorted(d.items(), key=lambda kv: -kv[1])[:5]
+                    return ' '.join(f'{prefix}{k}={v}' for k, v in items)
+                lk = locked_key[0] if locked_key[0] is not None else ('none', 0)
                 debug_dump(
                     'frame_stats',
-                    ('fed={} dropped={} drop_ssi={} drop_tn={} drop_enc={} '
-                     'drop_no_call={} locked_ssi={} locked_tn={} '
-                     'codec_resets={} fed_per_ssi=[{}] fed_per_tn=[{}] '
-                     'drop_per_ssi=[{}] drop_per_tn=[{}]').format(
-                        fed_count[0], drop_count[0],
-                        drop_ssi_count[0], drop_tn_count[0],
+                    ('fed={} dropped={} drop_lock={} drop_enc={} '
+                     'drop_no_call={} locked={}={} codec_resets={} '
+                     'fed_per_um=[{}] fed_per_ssi=[{}] fed_per_tn=[{}] '
+                     'drop_per_um=[{}] drop_per_ssi=[{}] drop_per_tn=[{}]').format(
+                        fed_count[0], drop_count[0], drop_lock_count[0],
                         drop_enc_count[0], drop_no_call_count[0],
-                        locked_ssi[0], locked_tn[0], codec_resets[0],
-                        ssi_top, tn_top, drop_ssi_top, drop_tn_top
+                        lk[0], lk[1], codec_resets[0],
+                        _top5(fed_per_um,  'um'),
+                        _top5(fed_per_ssi, 'ssi'),
+                        _top5(fed_per_tn,  'tn'),
+                        _top5(drop_per_um,  'um'),
+                        _top5(drop_per_ssi, 'ssi'),
+                        _top5(drop_per_tn,  'tn'),
                     ).encode(),
-                    max_bytes=512)
+                    max_bytes=640)
                 last_drop_log[0] = now
 
     sock.close()
