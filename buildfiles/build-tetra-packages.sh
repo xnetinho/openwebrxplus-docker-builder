@@ -11,27 +11,23 @@ apt-get install -y --no-install-recommends \
     ca-certificates build-essential pkg-config git wget unzip \
     libosmocore-dev python3-dev
 
-# ── 1. Clone sq5bpf-2 for tetra-rx (it exposes tms->ssi/tsn we need) ─────────
-pinfo "Cloning osmo-tetra-sq5bpf-2 (tetra-rx with per-call SSI access)..."
+# ── 1. Clone sq5bpf-2 for tetra-rx (it exposes tms->ssi/tsn/usage_marker) ────
+pinfo "Cloning osmo-tetra-sq5bpf-2 (tetra-rx with per-call SSI/UM access)..."
 git clone --depth 1 https://github.com/sq5bpf/osmo-tetra-sq5bpf-2 /tmp/osmo-tetra-2
 
-# ── 1b. Bug 15 patch — emit TN, SSI and TSN in the voice-frame header ────────
+# ── 1b. Bug 15 patch — emit TN, SSI, TSN, UM in the voice-frame header ────────
 #
-# Upstream sq5bpf-2 emits voice frames tagged only with TRA/RX/DECR — no
-# call identifier, so we cannot tell which SSI a burst belongs to. In a
-# busy talkgroup multiple SSIs share the same TS via PTT handoff,
-# producing the "scrambled but partially intelligible" symptom (Bug 14
-# residual after TN-lock).
-#
-# This patch:
-#   - expands the voice-frame header buffer from 20 to 64 bytes
-#   - adds TN (timeslot 1..4), SSI (caller address), and TSN (slot number)
-#   - keeps the binary block layout intact (now at offset 64)
+# Calibration of plain SSI demux revealed 96% of voice frames carry
+# SSI=0xFFFFFF (ALL-CALL broadcast destination, per ETSI EN 300 392-2),
+# making caller demux impossible from SSI alone. usage_marker is per-call
+# at the MAC layer — different concurrent calls on the same channel get
+# different UM values, so it can discriminate where SSI cannot.
 #
 # Wire format: [64-byte ASCII header NUL-padded] + [1380-byte ACELP block]
-#   header text: "TRA:HH RX:HH DECR:N TN:N SSI:N TSN:N\0"
-# UDP packet: 1444 bytes (was 1400).
-pinfo "Patching tetra_lower_mac.c for per-SSI voice demux (Bug 15)..."
+#   header text: "TRA:HH RX:HH DECR:N TN:N SSI:N TSN:N UM:N\0"
+# UDP packet: 1444 bytes (unchanged from previous Bug 15; UM fits in spare
+# header room).
+pinfo "Patching tetra_lower_mac.c for per-call voice demux (Bug 15 + UM)..."
 LMAC=/tmp/osmo-tetra-2/src/lower_mac/tetra_lower_mac.c
 
 # Buffer size: 1380+20 -> 1380+64
@@ -39,34 +35,35 @@ sed -i 's|unsigned char tmpstr\[1380+20\];|unsigned char tmpstr[1380+64];|' "$LM
 
 # sprintf + memcpy + sendto rewrite (perl handles the embedded \0).
 perl -i -pe '
-  s|sprintf\(tmpstr,"TRA:%2\.2x RX:%2\.2x DECR:%i\\0",tms->cur_burst\.is_traffic,tetra_hack_rxid,decrypted\);|memset(tmpstr,0,64);snprintf((char *)tmpstr,64,"TRA:%2.2x RX:%2.2x DECR:%i TN:%u SSI:%u TSN:%u",tms->cur_burst.is_traffic,tetra_hack_rxid,decrypted,tcd->time.tn,tms->ssi,tms->tsn);|;
+  s|sprintf\(tmpstr,"TRA:%2\.2x RX:%2\.2x DECR:%i\\0",tms->cur_burst\.is_traffic,tetra_hack_rxid,decrypted\);|memset(tmpstr,0,64);snprintf((char *)tmpstr,64,"TRA:%2.2x RX:%2.2x DECR:%i TN:%u SSI:%u TSN:%u UM:%i",tms->cur_burst.is_traffic,tetra_hack_rxid,decrypted,tcd->time.tn,tms->ssi,tms->tsn,tms->usage_marker);|;
   s|memcpy\(tmpstr\+20,block,sizeof\(block\)\);|memcpy(tmpstr+64,block,sizeof(block));|;
   s|sizeof\(block\)\+20|sizeof(block)+64|g;
 ' "$LMAC"
 
-# Hard-fail if any of the three rewrites silently missed.
+# Hard-fail if any of the rewrites silently missed.
 if ! grep -q 'tmpstr\[1380+64\]' "$LMAC"; then
     perror "Bug 15 patch failed: buffer-size rewrite did not apply"
     exit 1
 fi
-if ! grep -q 'SSI:%u TSN:%u' "$LMAC"; then
-    perror "Bug 15 patch failed: SSI/TSN fields not added to sprintf"
+if ! grep -q 'UM:%i' "$LMAC"; then
+    perror "Bug 15 patch failed: UM (usage_marker) field not added to sprintf"
+    exit 1
+fi
+if ! grep -q 'tms->usage_marker' "$LMAC"; then
+    perror "Bug 15 patch failed: usage_marker reference missing"
     exit 1
 fi
 if grep -q 'tmpstr+20,block' "$LMAC"; then
     perror "Bug 15 patch failed: legacy memcpy offset still present"
     exit 1
 fi
-pinfo "Voice demux patch applied; voice header is now 64 bytes with TN/SSI/TSN."
+pinfo "Voice demux patch applied; voice header is now 64 bytes with TN/SSI/TSN/UM."
 
 # ── 2. Clone sq5bpf (legacy) just for its codec.diff ─────────────────────────
 #
-# osmo-tetra-sq5bpf-2 ships a codec.diff that interprets every 5th input
-# frame as a TEA keystream block (the "install-tetra-codec" patch). We
-# don't load TEA keys, so feeding pure ACELP into that patched codec
-# corrupts every 5th frame and produces 300ms intelligible / 60ms
-# garbled in a loop (Bug 4). The legacy sq5bpf repo's codec.diff is
-# the older one without keystream interpretation — we use that.
+# osmo-tetra-sq5bpf-2 ships the install-tetra-codec patch which interprets
+# every 5th input frame as a TEA keystream block (Bug 4). Without keys this
+# corrupts every 5th frame. Use the legacy sq5bpf codec.diff instead.
 pinfo "Cloning osmo-tetra-sq5bpf (legacy) for codec.diff..."
 git clone --depth 1 https://github.com/sq5bpf/osmo-tetra-sq5bpf /tmp/osmo-tetra-codec-src
 
@@ -93,7 +90,7 @@ patch -p1 -N -E < codec.diff
 cd c-code && make ${MAKEFLAGS}
 cp cdecoder sdecoder "$TETRA_INSTALL_DIR/"
 
-# ── 4. Build tetra-rx from sq5bpf-2 (with our Bug 15 patch) ──────────────────
+# ── 4. Build tetra-rx from sq5bpf-2 (with our Bug 15+UM patch) ──────────────
 pinfo "Building tetra-rx from sq5bpf-2..."
 cd /tmp/osmo-tetra-2/src
 make ${MAKEFLAGS} tetra-rx
