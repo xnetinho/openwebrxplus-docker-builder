@@ -5,64 +5,55 @@ Reads complex float IQ from stdin (36 kS/s, centered on TETRA carrier).
 Writes PCM audio to stdout (8 kHz, 16-bit signed LE, mono).
 Writes JSON metadata to stderr (TETMON signaling: network info, calls).
 
-Per-call voice demultiplexing (Bug 15 round 2):
-  Patched upstream `osmo-tetra-sq5bpf-2` (see build-tetra-packages.sh)
-  emits voice frames with a 64-byte header carrying:
-    - TRA  (is_traffic flag)
-    - RX   (rxid, fixed)
-    - DECR (decryption success)
-    - TN   (timeslot 1..4)
-    - SSI  (MAC RESOURCE address — destination, may be 0xFFFFFF=ALL-CALL)
-    - TSN  (slot number)
-    - UM   (usage_marker — per-call channel identifier from upper MAC)
+Voice demultiplexing strategy (final, after Bug 15 round 2 calibration):
 
-  Demux uses a layered "first-key-wins" lock with priority:
-    1. UM > 0          (most specific — per-call channel identifier)
-    2. SSI > 0 AND SSI != 0xFFFFFF   (real subscriber/group SSI)
-    3. TN >= 0         (fallback — timeslot grouping)
-    4. otherwise no demux (pass through).
+  Primary lock = TN (timeslot). SSI and UM fields are parsed and
+  logged for diagnostic purposes but DO NOT affect the lock decision.
 
-  When a frame arrives, the lock-key is computed by this priority and
-  matched against the currently locked key. Cross-key frames are
-  dropped until silence > TETRA_LOCK_TIMEOUT seconds.
+  Why not SSI/UM:
+    - Session 9 (Bug 15 round 1) showed 96% of voice frames carry
+      SSI=0xFFFFFF (TETRA ALL-CALL broadcast destination per ETSI EN
+      300 392-2). Caller ISSI is not in the MAC RESOURCE address that
+      tms->ssi exposes.
+    - Session 9 (Bug 15 round 2) showed tms->usage_marker is always 0
+      on this build/network for voice bursts. Useless as discriminator.
+    - Session 9 calibration with UM>SSI>TN unified lock made audio
+      WORSE — short SSI-lock periods (2-5 s each) chopped the codec
+      input into discontinuous fragments from different talkers, with
+      cross-talker drops fragmenting ACELP state.
 
-  Background:
-  - Session 8: TN-lock alone catches cross-TN cross-talk (~8% of frames)
-    but multi-talker on same TN passes through.
-  - Session 9: SSI-lock revealed 96% of voice frames have SSI=0xFFFFFF
-    (ALL-CALL destination per ETSI EN 300 392-2) on this network.
-    Caller-side info needs another field.
-  - Round 2: UM (usage_marker) added to provide caller-side
-    discrimination while keeping SSI/TN as fallback.
+  Conclusion: with the upstream-exposed fields, only TN gives a stable
+  enough grouping to preserve codec continuity. Per-talker demux on
+  broadcast traffic would require patching the upper MAC to extract
+  caller ISSI from MAC-RESOURCE PDU parsing — invasive on a "work in
+  progress, may coredump" upstream.
+
+Voice frame format (sq5bpf-2 + Bug 15 patch — kept for diagnostics):
+  64-byte ASCII header + 1380-byte ACELP block. Header text:
+  "TRA:HH RX:HH DECR:N TN:N SSI:N TSN:N UM:N\\0".
+  Backward-compat parsing for 32-byte (Bug 14) and legacy headers.
 
 Codec reset on unlock (Bug 14b): disabled by default after calibration
-showed it caused glitches. Enable via `TETRA_RESET_CODEC_ON_UNLOCK=1`.
+showed it caused glitches without improving intelligibility. Enable
+via `TETRA_RESET_CODEC_ON_UNLOCK=1`.
 
-Frame-level statistical filter (Bug 13, abandoned): metric infrastructure
-kept as debug surface. Off when `TETRA_ENC_RATIO_THRESHOLD=0`.
+Frame-level statistical filter (Bug 13, abandoned): metric infra kept
+as debug surface, off when `TETRA_ENC_RATIO_THRESHOLD=0` (default).
 
 Debug:
   TETRA_DEBUG=1                  -> dumps to /tmp/tetra-debug.log.
   TETRA_PCM_DUMP=/path.raw       -> appends each PCM chunk to file.
-  TETRA_LOCK_TIMEOUT=2.0         -> seconds of silence on the locked key
-                                    before another key can claim the
-                                    codec. Set 0 to disable demux entirely.
-                                    (Replaces the older TETRA_SSI_LOCK_TIMEOUT
-                                    / TETRA_TN_LOCK_TIMEOUT envs; kept as
-                                    aliases for backward compat.)
-  TETRA_RESET_CODEC_ON_UNLOCK=0  -> kill+restart codec on unlock.
-                                    Default off.
+  TETRA_LOCK_TIMEOUT=2.0         -> seconds of silence on the locked TN
+                                    before another TN can claim the
+                                    codec. Set 0 to disable demux.
+                                    (Aliases: TETRA_TN_LOCK_TIMEOUT,
+                                    TETRA_SSI_LOCK_TIMEOUT, kept for
+                                    backward compat — same value used.)
+  TETRA_RESET_CODEC_ON_UNLOCK=0  -> kill+restart codec on unlock. off.
   TETRA_ENC_METRIC=bitsD         -> Bug 13 statistical metric (debug).
   TETRA_ENC_RATIO_THRESHOLD=0    -> drop frames whose chosen metric
                                     exceeds threshold (0 = off).
   TETRA_DROP_NO_CALL=0           -> legacy clear-call filter (off).
-
-Voice frame format (after Bug 15 round 2 upstream patch):
-  64-byte ASCII header (NUL-padded after the snprintf text) plus
-  1380-byte ACELP soft-bit block. UDP packet = 1444 bytes total.
-  Header text: "TRA:HH RX:HH DECR:N TN:N SSI:N TSN:N UM:N\\0".
-  Older formats (Bug 15 round 1 v64-byte without UM, Bug 14 v32-byte,
-  legacy v13/v20) still parse with the missing fields = -1.
 """
 
 import datetime
@@ -91,36 +82,31 @@ def _env_float(name, default):
         return float(os.environ.get(name, str(default)))
     except ValueError:
         return default
-# Unified lock timeout. Reads TETRA_LOCK_TIMEOUT, falls back to the
-# older SSI/TN names if those are set explicitly.
 TETRA_LOCK_TIMEOUT = _env_float(
     "TETRA_LOCK_TIMEOUT",
-    _env_float("TETRA_SSI_LOCK_TIMEOUT",
-               _env_float("TETRA_TN_LOCK_TIMEOUT", 2.0)))
+    _env_float("TETRA_TN_LOCK_TIMEOUT",
+               _env_float("TETRA_SSI_LOCK_TIMEOUT", 2.0)))
 TETRA_RESET_CODEC_ON_UNLOCK = os.environ.get("TETRA_RESET_CODEC_ON_UNLOCK", "0") == "1"
 _VALID_METRICS = ("full", "sign", "bits", "flip", "signD", "bitsD", "flipD")
 TETRA_ENC_METRIC = os.environ.get("TETRA_ENC_METRIC", "bitsD")
 if TETRA_ENC_METRIC not in _VALID_METRICS:
     TETRA_ENC_METRIC = "bitsD"
-TETRA_ENC_RATIO_LOG_EVERY = 10  # log all metrics every Nth voice frame
+TETRA_ENC_RATIO_LOG_EVERY = 10
 
 ACELP_FRAME_SIZE = 1380
 PCM_OUTPUT_BYTES = 960
 CALL_STALE_TIMEOUT = 30.0
 
-HEADER_SIZE_BUG15 = 64    # patched sq5bpf-2: TRA RX DECR TN SSI TSN [UM]
+HEADER_SIZE_BUG15 = 64    # patched sq5bpf-2: TRA RX DECR TN SSI TSN UM
 HEADER_SIZE_BUG14 = 32    # patched sq5bpf:   TRA RX TN
 HEADER_SIZE_LEGACY = 13
 
-# Soft-bit window in the cdecoder frame (skip magic + filler).
 SOFT_BIT_BYTES_START = 2
 SOFT_BIT_BYTES_END = 872
 
-# SSI=0xFFFFFF is the TETRA ALL-CALL broadcast destination address per
-# ETSI EN 300 392-2. Useless as a per-talker discriminator.
+# Documented for diagnostics; not used in lock decision.
 SSI_BROADCAST = 0xFFFFFF
 
-# Legacy variable-length header pattern (still accepted as fallback).
 AUDIO_PATTERN_LEGACY = re.compile(
     rb"TRA:[0-9a-fA-F]+ +RX:[0-9a-fA-F]+(?: +DECR:[0-9a-fA-F]+ +|\x00)"
 )
@@ -132,7 +118,7 @@ try:
     _DEBUG_FH.write(
         '\n=== tetra_decoder.py startup at {} | TETRA_DEBUG={} | PCM_DUMP={} | '
         'DROP_NO_CALL={} | LOCK_TIMEOUT={} | RESET_ON_UNLOCK={} | '
-        'ENC_METRIC={} | ENC_RATIO_THRESHOLD={} ===\n'.format(
+        'ENC_METRIC={} | ENC_RATIO_THRESHOLD={} | LOCK_KIND=TN-only ===\n'.format(
             datetime.datetime.now().isoformat(timespec='seconds'),
             'on' if TETRA_DEBUG else 'off',
             TETRA_PCM_DUMP or 'off',
@@ -377,7 +363,7 @@ def find_free_port():
 
 
 def _parse_voice_header(header_bytes):
-    """Return dict {tn, ssi, tsn, decr, um} extracted from the ASCII header.
+    """Return dict {tn, ssi, tsn, decr, um} from the ASCII header.
     Missing fields = -1. Returns None if no TRA: marker.
     """
     nul_pos = header_bytes.find(b'\x00')
@@ -406,7 +392,7 @@ def parse_audio_from_udp(data):
     """Parse a TETMON voice UDP packet.
 
     Returns (meta_dict, acelp_bytes) or None.
-    meta_dict = {tn, ssi, tsn, decr, um}, with -1 for missing fields.
+    meta_dict = {tn, ssi, tsn, decr, um} with -1 for missing fields.
     """
     tra_pos = data.find(b'TRA:')
     if tra_pos < 0:
@@ -434,21 +420,17 @@ def parse_audio_from_udp(data):
 
 
 def _frame_lock_key(meta):
-    """Return the best lock key for this voice frame, or None.
+    """Lock key = TN only.
 
-    Priority:
-      1. UM > 0  (per-call channel marker — caller-side info)
-      2. SSI > 0 AND SSI != 0xFFFFFF (real subscriber/group SSI)
-      3. TN >= 0 (timeslot fallback)
-      None when no useful key is present.
+    Earlier rounds tried UM>SSI>TN priority but calibration session 9
+    showed UM is always 0 on this build/network, and SSI dominant value
+    is 0xFFFFFF (broadcast). The unified lock churned across short SSI
+    sessions and made the audio worse. TN remains the only field that
+    keeps codec continuity.
+
+    SSI/UM are still parsed and logged in stats for visibility.
     """
-    um  = meta.get('um',  -1)
-    ssi = meta.get('ssi', -1)
-    tn  = meta.get('tn',  -1)
-    if um > 0:
-        return ('um', um)
-    if ssi > 0 and ssi != SSI_BROADCAST:
-        return ('ssi', ssi)
+    tn = meta.get('tn', -1)
     if tn >= 0:
         return ('tn', tn)
     return None
@@ -659,7 +641,7 @@ def main():
     drop_per_tn = {}
     enc_frame_index = [0]
     last_drop_log = [time.monotonic()]
-    locked_key = [None]   # ('um', N) | ('ssi', N) | ('tn', N) | None
+    locked_key = [None]
     locked_key_last_seen = [0.0]
     codec_resets = [0]
 
@@ -795,10 +777,9 @@ def main():
             enc_frame_index[0] += 1
             now = time.monotonic()
 
-            # ───── Bug 15 round 2: unified UM > SSI > TN lock ─────────
+            # ───── TN-only lock (final design — see module docstring) ─
             lock_says_drop = False
             frame_key = _frame_lock_key(voice_meta)
-
             if TETRA_LOCK_TIMEOUT > 0 and frame_key is not None:
                 if (locked_key[0] is not None and
                         now - locked_key_last_seen[0] > TETRA_LOCK_TIMEOUT):
