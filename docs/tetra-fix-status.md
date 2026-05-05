@@ -1,10 +1,39 @@
 # TETRA Frequency Monitoring Branch — Status & Roadmap
 
 Branch: `claude/tetra-frequency-monitoring-3IqM9`
-Last updated: 2026-05-04 (session 9)
+Last updated: 2026-05-05 (session 10 — final)
 
 Purpose: fix the TETRA decoder pipeline so the OpenWebRX+ panel matches
 reality and unencrypted voice traffic plays back as audio.
+
+---
+
+## Final state
+
+The audio pipeline is at its **best achievable state given upstream
+constraints**: TN-only lock with sq5bpf-2 backbone (kept for the
+diagnostic fields it exposes). Per-talker demux is **not possible** on
+this network without patching the upper MAC to extract caller ISSI
+from MAC-RESOURCE PDU parsing — see Bug 15 finalisation below for
+the evidence trail.
+
+What works:
+  - All 10 backend bugs from sessions 1–3 fixed.
+  - Frontend timeslot indicators (Bug 16, plugins repo) merged to main.
+  - TN-lock (Bug 14) drops ~8% of cross-TN frames cleanly.
+  - 64-byte voice header (Bug 15) emits TN/SSI/TSN/DECR/UM for
+    diagnostics; backwards-compatible parsing for older formats.
+
+What does not work and why:
+  - Per-talker demux. SSI on this network is dominated by ALL-CALL
+    broadcast (94–96%); usage_marker is always 0 in sq5bpf-2 voice
+    bursts. Both fields fail to discriminate concurrent talkers.
+
+User-visible result on this network: the same "partially intelligible /
+partially scrambled" baseline as Bug 14 alone. Single-talker periods
+decode cleanly; multi-talker broadcast PTT handoffs continue to
+overlap because the upstream simply does not expose caller-side info
+in the voice path.
 
 ---
 
@@ -67,11 +96,11 @@ voice — matches DMR/NXDN.
 
 `debug_dump` writes to `/tmp/tetra-debug.log` instead of stderr.
 
-### Bug 11 — Codec output mixed clear+scrambled (REFRAMED — see Bug 14)
+### Bug 11 — Codec output mixed clear+scrambled (REFRAMED — see Bug 14/15)
 
 Initial hypothesis (encrypted bursts decoded as ACELP garbage) drove
 Bugs 12/13 work — both failed. Session 7 user observation reframed
-this as **multi-talker interleaving** → Bug 14.
+this as **multi-talker interleaving** → Bug 14, then Bug 15.
 
 ### Bug 12 — Active-clear-call filter (ATTEMPTED, FAILED — `f0ed4d2`)
 
@@ -87,11 +116,11 @@ ACELP soft-bits after Viterbi are statistically random regardless
 of clear/encrypted. **Option A is dead.** Metric infrastructure
 left as debug surface (`TETRA_ENC_RATIO_THRESHOLD=0` = off).
 
-### Bug 14 — Multi-TS interleaving (PARTIALLY WORKED — superseded by Bug 15)
+### Bug 14 — Multi-TS interleaving (PARTIALLY FIXED — TN-lock kept as final design)
 
 User narrative: "scrambled audio is the same clean voice played out
-of order, partially intelligible." Confirmed multi-source
-interleaving, not encryption.
+of order, partially intelligible." Confirmed multi-source interleaving,
+not encryption.
 
 #### Implementation
 
@@ -110,8 +139,8 @@ interleaving, not encryption.
 | Audio quality | still mixed (residual scramble) |
 
 Conclusion: TN-lock works as designed but residual scramble means
-**multiple SSIs share the same TN** via PTT handoff. Need per-SSI
-demux (Bug 15).
+multiple SSIs share the same TN via PTT handoff. Investigated in
+Bug 15 below; ultimately TN-lock remains the best stable design.
 
 ### Bug 14b — Codec reset on TN unlock (TRIED, DISABLED)
 
@@ -121,19 +150,21 @@ Implementation: kill+restart cdecoder/sdecoder on every TN unlock.
 Session-9 calibration result: **made audio worse** (parts that were
 intelligible became scrambled too). 400 codec resets in 3 h
 introduced glitches without improving inter-speaker discrimination.
-With `TETRA_RESET_CODEC_ON_UNLOCK=0` audio returned to the
-"partially intelligible / partially scrambled" baseline.
+With `TETRA_RESET_CODEC_ON_UNLOCK=0` audio returned to baseline.
 
 Decision: kept in code, defaults **off**. Marked dormant.
 
-### Bug 15 — Per-SSI demultiplexing via osmo-tetra-sq5bpf-2 migration (IMPLEMENTED — pending validation)
+### Bug 15 — Per-call demultiplexing via osmo-tetra-sq5bpf-2 migration (CALIBRATED — TN-lock final)
 
-#### Why migrate
+This is the longest investigation in the branch. Final outcome:
+**migrate to sq5bpf-2 for the diagnostic fields it exposes, but lock
+on TN only — UM and SSI proved unusable on this network**.
+
+#### Why migrate to sq5bpf-2
 
 `osmo-tetra-sq5bpf` (legacy, what we used through Bug 14) does NOT
-have `tms->ssi` in `struct tetra_mac_state`. Only the `-sq5bpf-2`
-fork exposes the per-call SSI/TSN. Per-talker demux is impossible
-without those fields.
+have `tms->ssi`, `tms->tsn`, or `tms->usage_marker` in its
+`struct tetra_mac_state`. Only the `-sq5bpf-2` fork exposes them.
 
 #### Build strategy
 
@@ -152,87 +183,78 @@ Build now clones **two** repos:
 cdecoder/sdecoder built using the legacy diff; tetra-rx built from
 sq5bpf-2 with our patch.
 
-#### Bug 15 patch
+`README.md` of sq5bpf-2 explicitly warns: *"the new osmo-tetra
+versions will coredump with a lot of real world traffic, so this
+fork will do it too"* and *"Actually you're lucky if it even
+compiles"*. We accept this risk in exchange for the additional
+diagnostic fields.
 
-In sq5bpf-2's `tp_sap_udata_ind`, case `TPSAP_T_SCH_F`, replace the
-voice sprintf:
+#### Bug 15 patch (round 2 — final, with UM)
+
+In sq5bpf-2's `tp_sap_udata_ind`, case `TPSAP_T_SCH_F`, the voice
+sprintf becomes:
 
 ```c
-- unsigned char tmpstr[1380+20];
-+ unsigned char tmpstr[1380+64];
+unsigned char tmpstr[1380+64];
 ...
-- sprintf(tmpstr,"TRA:%2.2x RX:%2.2x DECR:%i\0",
--     tms->cur_burst.is_traffic, tetra_hack_rxid, decrypted);
-- memcpy(tmpstr+20, block, sizeof(block));
-- sendto(..., sizeof(block)+20, ...);
-+ memset(tmpstr, 0, 64);
-+ snprintf((char *)tmpstr, 64, "TRA:%2.2x RX:%2.2x DECR:%i TN:%u SSI:%u TSN:%u",
-+     tms->cur_burst.is_traffic, tetra_hack_rxid, decrypted,
-+     tcd->time.tn, tms->ssi, tms->tsn);
-+ memcpy(tmpstr+64, block, sizeof(block));
-+ sendto(..., sizeof(block)+64, ...);
+memset(tmpstr, 0, 64);
+snprintf((char *)tmpstr, 64, "TRA:%2.2x RX:%2.2x DECR:%i TN:%u SSI:%u TSN:%u UM:%i",
+    tms->cur_burst.is_traffic, tetra_hack_rxid, decrypted,
+    tcd->time.tn, tms->ssi, tms->tsn, tms->usage_marker);
+memcpy(tmpstr+64, block, sizeof(block));
+sendto(..., sizeof(block)+64, ...);
 ```
 
-UDP voice packet becomes 1444 bytes (was 1400 in sq5bpf-2 stock,
-1412 in our Bug 14 patched sq5bpf, 1393 in legacy sq5bpf).
+UDP voice packet becomes 1444 bytes. Three grep assertions hard-fail
+the build if the rewrites silently miss.
 
-Three grep assertions hard-fail the build if the rewrites silently
-miss.
+#### Session-9/10 calibration result
 
-#### Python wrapper changes
+| Field | Observation | Verdict |
+|---|---|---|
+| `UM` (usage_marker) | 2320/2320 frames have `UM:0` | unusable |
+| `SSI` | 96% have `SSI=0xFFFFFF` (TETRA ALL-CALL broadcast); 4% have specific SSIs in 2–5 s bursts | unusable as primary lock |
+| `TN` | TN=2 dominant 90% + others — same as session 8 | usable |
+| `DECR` | always 0 (no TEA keys) | informational only |
 
-`_parse_voice_header()` extracts `tn`, `ssi`, `tsn`, `decr` from the
-ASCII text portion of the 64-byte header.
+Critically: the unified `UM > SSI > TN` lock (commit `4069fb4`) made
+audio **worse** than TN-only. Short SSI sessions (2–5 s) caused
+constant lock churn; cross-key drops fragmented ACELP codec
+continuity, producing fully scrambled output where TN-only had been
+"partially intelligible".
 
-`parse_audio_from_udp()` tries three formats in order:
-  1. 64-byte (Bug 15) — has SSI for per-call demux.
-  2. 32-byte (Bug 14) — has TN only.
-  3. Variable legacy header.
+Reason SSI fails: `tms->ssi` exposes the **destination** address from
+MAC RESOURCE PDU. For broadcast group calls, destination is
+`0xFFFFFF` (ALL-CALL) regardless of caller. Reason UM fails: the
+upper MAC of sq5bpf-2 simply doesn't populate `tms->usage_marker`
+for these voice bursts on this network.
 
-Returns `(meta_dict, acelp_bytes)`.
+#### Final design (commit `bd7eccc`)
 
-Main loop applies layered locks:
-  - **SSI-lock (primary)**: first non-zero SSI claims codec; other
-    SSIs dropped until silence > `TETRA_SSI_LOCK_TIMEOUT` (default
-    2.0 s).
-  - **TN-lock (fallback)**: when SSI absent (legacy binary), behaves
-    like Bug 14.
-  - **Bug 14b codec reset**: now opt-in (default off).
+  - Lock kind: TN only.
+  - SSI / UM / TSN / DECR fields **kept in the wire format** for
+    diagnostics — `parse_audio_from_udp` extracts them, `frame_stats`
+    logs `fed_per_um/ssi/tn` and `drop_per_um/ssi/tn`. They just
+    don't drive the lock decision.
+  - `TETRA_LOCK_TIMEOUT` (default 2.0) governs the TN-lock; aliases
+    `TETRA_TN_LOCK_TIMEOUT` and `TETRA_SSI_LOCK_TIMEOUT` retained
+    for backward-compat.
+  - Bug 14b codec reset stays opt-in (`TETRA_RESET_CODEC_ON_UNLOCK=0`
+    by default).
+  - Build infra (sq5bpf-2 + 64-byte header) preserved — if a future
+    upstream fix populates UM, the field is already on the wire and
+    we can re-enable per-call lock by reverting the one-liner in
+    `_frame_lock_key`.
 
-`frame_stats` debug log adds `fed_per_ssi`, `drop_per_ssi`,
-`locked_ssi` so the user can validate. Expected pattern with Bug 15
-working on busy talkgroup:
-```
-fed_per_ssi=[ssi14002849=N1] drop_per_ssi=[ssi14003001=N2 ssi14003015=N3]
-```
-Single SSI fed, others dropped during the lock.
+Per-talker demux on this network would now require a deeper patch
+to the **upper MAC** in sq5bpf-2 to extract caller ISSI from
+MAC-RESOURCE PDU parsing and copy it to a new field on
+`struct tetra_mac_state`. The author of sq5bpf-2 explicitly warns
+the codebase coredumps on real-world traffic, so further invasive
+patching is out of scope without strong evidence the caller field
+even survives ALL-CALL broadcast framing.
 
-#### Validation plan
-
-Rebuild image, listen for ~5 minutes covering multi-talker activity:
-
-```sh
-# UDP packet size: should be 1444 (proves Bug 15 C patch active)
-grep -oE 'len=14[34][0-9]' /opt/owrx-docker/debug/tetra-debug.log \
-  | sort | uniq -c
-
-# Per-SSI distribution
-grep frame_stats /opt/owrx-docker/debug/tetra-debug.log | tail -10
-
-# SSI lock churn
-grep -E 'ssi_lock|ssi_unlock' /opt/owrx-docker/debug/tetra-debug.log
-```
-
-Decision tree:
-  - **Audio fully intelligible**: Bug 15 confirmed, close.
-  - **Audio improved but still glitchy on speaker handoff**: SSI
-    detection works but codec needs warm-up between speakers.
-    Selectively re-enable Bug 14b reset OR add a small pre-roll.
-  - **Audio still mixed at same level as Bug 14**: SSI field is
-    inconsistent or 0 in this build → investigate sq5bpf-2 SSI
-    population timing.
-
-### Bug 16 — Frontend timeslot lights & call routing (FIXED on plugins repo)
+### Bug 16 — Frontend timeslot lights & call routing (FIXED — plugins repo)
 
 Discovered while comparing with `trollminer/OpenWebRX-Tetra-Plugin`:
 
@@ -242,27 +264,28 @@ Discovered while comparing with `trollminer/OpenWebRX-Tetra-Plugin`:
   3. `TetraMetaSlot.update` read `data.issi` / `data.gssi` — backend
      emits `ssi` / `ssi2` (TETMON convention).
 
-Fixed in `xnetinho/openwebrxplus-plugins` branch:
+Fixed in `xnetinho/openwebrxplus-plugins`:
   - `0a75caf` v1.5 — first attempt (based on stale v1.3 base).
-  - `3d215bd` v1.6 — merged with main's v1.4 features (Cell Sec
-    separate row, idle state, statusNames, _fmtStatus, _fmtSds).
+  - `3d215bd` v1.6 — merged with main's v1.4 features.
   - `8b035b0` — tetra.css aligned with main v1.4.
-  - PR merged to main as `464fafd`.
+  - `464fafd` — PR #2 merged to main.
 
-User confirmation (session 9): TS1-4 now light correctly. ISSI/GSSI
-per slot still empty because the backend doesn't tag calls with TN
-(deferred — needs Bug 17 if desired).
+Confirmed working session 9. Per-slot ISSI/GSSI population (Bug 17)
+deferred — backend would need to tag calls with TN to do that
+correctly.
 
 ---
 
 ## What was done in this branch (commits in chronological order)
 
+### Docker-builder repo
+
 | SHA | File | Summary |
 |---|---|---|
 | `7c740a1` | `tetra_decoder.py` | NETINFO1/ENCINFO1 emit cell capability fields |
-| `c38183f` | plugins | Mirror v1.3 frontend |
+| `c38183f` | plugins (mirror) | Mirror v1.3 frontend |
 | `175b1e8` | `tetra_decoder.py` | enc in (1,2,3); dynamic header offset |
-| `69276de` | plugins | v1.4 split Cell Sec / Encryption |
+| `69276de` | plugins (mirror) | v1.4 split Cell Sec / Encryption |
 | `cfd357e` | docs | Initial status doc |
 | `365ec98` | `tetra_decoder.py` | Remove silence_20ms padding |
 | `00c45c2` | `tetra_decoder.py` | Debug dump to file |
@@ -277,16 +300,21 @@ per slot still empty because the backend doesn't tag calls with TN
 | `6ebdd1a` | `tetra_decoder.py` | Bug 13 attempt 1: zlib full frame |
 | `97d9d34` | `tetra_decoder.py` | Bug 13 attempt 2: zlib sign bytes |
 | `315e15d` | `tetra_decoder.py` | Bug 13 attempt 3: 4 metrics |
-| `6470d93` | `tetra_decoder.py` | Bug 13 attempt 4: data-window metrics — Option A dead |
+| `6470d93` | `tetra_decoder.py` | Bug 13 attempt 4: data-window — Option A dead |
 | `ce38fc8` | docs | Register Bug 13 abandonment + Bug 14 hypothesis |
 | `a02be9b` | `build-tetra-packages.sh` | **Bug 14**: TN field in 32-byte voice header |
 | `ae524aa` | `tetra_decoder.py` | **Bug 14 wrapper**: TN demux |
 | `28e9e66` | docs | Register Bug 14 implementation |
 | `64bbb33` | `tetra_decoder.py` | **Bug 14b**: codec reset on unlock (later disabled) |
-| `49ded77` | `build-tetra-packages.sh` | **Bug 15**: migrate to sq5bpf-2 + 64-byte voice header (TN/SSI/TSN/DECR) |
-| `dbfdf29` | `tetra_decoder.py` | **Bug 15 wrapper**: SSI-lock demux + Bug 14b default off |
+| `49ded77` | `build-tetra-packages.sh` | **Bug 15**: migrate to sq5bpf-2 + 64-byte voice header |
+| `dbfdf29` | `tetra_decoder.py` | **Bug 15 wrapper**: SSI-lock primary (made audio worse) |
+| `7e9fe93` | docs | Register Bug 15 round 1 |
+| `3b3f7f6` | `build-tetra-packages.sh` | Bug 15 round 2: add UM (usage_marker) to voice header |
+| `4069fb4` | `tetra_decoder.py` | Bug 15 round 2: unified UM>SSI>TN lock (also made audio worse) |
+| `bd7eccc` | `tetra_decoder.py` | **Bug 15 final**: revert lock to TN-only; UM/SSI become diagnostic-only |
 
-Plugins repo (separate):
+### Plugins repo
+
 | SHA | File | Summary |
 |---|---|---|
 | `0a75caf` | `tetra.js` | v1.5 Bug 16: data.timeslots iteration + slot routing |
@@ -296,16 +324,21 @@ Plugins repo (separate):
 
 ---
 
-## Voice frame wire format (current, after Bug 15)
+## Voice frame wire format (current, after Bug 15 final)
 
 ```
 [64-byte ASCII header, NUL-padded] + [1380-byte ACELP soft-bit block]
-header text: "TRA:HH RX:HH DECR:N TN:N SSI:N TSN:N\0"
+header text: "TRA:HH RX:HH DECR:N TN:N SSI:N TSN:N UM:N\0"
 UDP packet size: 1444 bytes
 ```
 
 Backward-compat: 32-byte (Bug 14) and variable-length legacy headers
-still parse, with `ssi=-1` / `tsn=-1` / `decr=-1` for missing fields.
+still parse, with `ssi=-1` / `tsn=-1` / `decr=-1` / `um=-1` for
+missing fields.
+
+Active lock decision uses **TN only**. SSI/UM/TSN/DECR are parsed
+into `voice_meta` and surfaced in `frame_stats` debug output for
+operators to observe network behaviour.
 
 ---
 
@@ -319,46 +352,46 @@ still parse, with `ssi=-1` / `tsn=-1` / `decr=-1` for missing fields.
 | Panel freezes on first ACELP | -> panel keeps updating | YES (`52d8833`) |
 | TS1 only lights on the panel | -> all 4 TS reflect data.timeslots | YES (`3d215bd`) session-9 |
 | TEA1 false positive on clear calls | -> ENCR-derived encryption | superseded |
-| Mixed clear+scrambled audio | -> reframed as multi-talker interleaving (Bug 14/15) | confirmed |
+| Mixed clear+scrambled audio | -> reframed as multi-talker interleaving | confirmed |
 | `TETRA_DROP_NO_CALL=1` filters encrypted | -> total silence (Bug 12) | filter unusable |
 | Bug 13 statistical filter discriminates | -> all 7 metrics single cluster | Option A dead |
-| Bug 14 TN demux eliminates cross-talk | -> works for cross-TN (~8% drop) | confirmed session 8 |
+| Bug 14 TN demux eliminates cross-TN cross-talk | -> ~8% cross-TN drops | confirmed session 8 |
 | Bug 14b codec reset improves audio | -> introduces glitches, no improvement | disabled session 9 |
-| Bug 15 SSI demux eliminates intra-TN cross-talk | pending user validation | OPEN |
+| Bug 15 round 1 SSI-lock improves audio | -> 96% SSI=ALL-CALL, dominant lock churn | reverted session 9 |
+| Bug 15 round 2 UM-lock improves audio | -> UM=0 always, audio worse than Bug 14 | reverted session 10 |
+| **Bug 15 final TN-only lock + sq5bpf-2** | -> back to Bug 14 baseline + better diagnostics | confirmed session 10 |
 
 ---
 
-## Open work
+## Open work / deferred
 
-### Bug 15 validation (next)
+### Bug 17 — Per-slot ISSI/GSSI population (deferred)
 
-User rebuilds image with commits `49ded77` + `dbfdf29`, listens
-~5 minutes covering multi-talker activity, reports:
-  - Voice UDP packet size = 1444 (proving Bug 15 C patch active)
-  - `frame_stats` `fed_per_ssi` shows multiple SSIs being seen
-  - `drop_per_ssi` non-zero during multi-talker bursts
-  - Audio intelligibility end-to-end with default
-    `TETRA_SSI_LOCK_TIMEOUT=2.0`
+With Bug 15 the backend now has SSI per voice frame. The frontend
+could correlate calls to slots via signaling FUNCs and populate
+per-slot ISSI/GSSI. Cosmetic. Defer until per-call demux becomes
+viable (would require upper-MAC patch).
 
 ### Two decoder instances (config side, not our bug)
 
-User confirmed `ps auxf` shows two complete `tetra_decoder.py` +
-`tetra_demod.py` + `tetra-rx` chains running concurrently, even
-after a clean container restart. This is structural to the user's
-OWRX+ config (likely two TETRA profiles or two SDRs). Each has its
-own UDP port and its own stdout pipe to OWRX+, so they don't
-corrupt each other's audio — only the shared debug log file gets
-intercalated. Not a fix needed in our code; user can verify config.
-
-### Frontend per-slot ISSI/GSSI population (Bug 17 — deferred)
-
-With Bug 15 the backend now has SSI per voice frame. We could
-correlate calls to slots via signaling FUNCs and populate per-slot
-ISSI/GSSI. Cosmetic. Defer until Bug 15 audio is confirmed.
+User confirmed `ps auxf` shows two complete `tetra_decoder.py` chains
+running concurrently, even after a clean container restart. Structural
+to the OWRX+ config (likely two TETRA profiles or two SDRs). Each has
+its own UDP port and stdout pipe; they don't corrupt each other's
+audio — only the shared debug log file gets intercalated. Not a fix
+needed in our code.
 
 ### Frontend SCK-locked badge state, STATUS code dictionary, TS slot stale, frequency offset
 
 Cosmetic / non-blocking. Carry over from earlier sessions.
+
+### Caller-ISSI extraction (long shot)
+
+Patching the upper MAC in sq5bpf-2 to parse MAC-RESOURCE PDU caller
+side and copy it to `struct tetra_mac_state` would enable per-talker
+demux. Out of scope absent strong evidence the broadcast traffic on
+this network actually carries a per-burst caller field. Coredump
+warnings on the upstream make this risky.
 
 ---
 
@@ -367,9 +400,9 @@ Cosmetic / non-blocking. Carry over from earlier sessions.
 ### mbbrzoza/OpenWebRX-Tetra-Plugin
 
 Same `osmo-tetra-sq5bpf` (legacy) upstream + ETSI codec. Has Bug 7
-(deadlock), Bug 8 (-e flag inconsistency before our `fec8ff9`), Bug
-9 (silence padding), Bug 16 (data.slot bug). Same audio interleaving
-problem we've now isolated. Doesn't address it.
+(deadlock), Bug 8 (-e flag), Bug 9 (silence padding), Bug 16
+(data.slot bug). Same audio interleaving problem we've now isolated.
+Doesn't address it.
 
 ### aruznieto/TetraEar
 
@@ -380,18 +413,16 @@ cdecoder input format we send is correct.
 ### trollminer/OpenWebRX-Tetra-Plugin (session 8)
 
 Uses sq5bpf legacy + same 4-TS-light bug we fixed in Bug 16. No
-audio (their codec deadlocks like our pre-Bug-7). Useful comparison
-for confirming the `data.timeslots` payload shape.
+audio (their codec deadlocks like our pre-Bug-7).
 
 ---
 
 ## Session log (high-level)
 
-- **Session 1–3**: Bugs 1–10. Async pipeline, debug-to-file,
-  -e flag fix, codec.diff revert, ENCR/ENCC convergence.
+- **Session 1–3**: Bugs 1–10. Async pipeline, debug-to-file, -e flag
+  fix, codec.diff revert, ENCR/ENCC convergence.
 - **Session 4–5**: Bug 11 isolation via PCM dump. Bug 12 attempted
-  (signaling-gate, fails — short-form FUNCs too sparse). Bug 13
-  opened.
+  (signaling-gate, fails — short-form FUNCs too sparse). Bug 13 opened.
 - **Session 6–7**: Bug 13 — 7 statistical metrics tried, all fail.
   Option A formally abandoned. User narrative reframes Bug 11 as
   multi-talker interleaving. Bug 14 opened.
@@ -399,8 +430,17 @@ for confirming the `data.timeslots` payload shape.
   drops confirmed in calibration but residual audio scramble
   remains, indicating intra-TN multi-SSI is the dominant cause.
 - **Session 9**: Bug 14b codec-reset experiment (failed, disabled).
-  Frontend Bug 16 found via trollminer comparison and fixed in
-  plugins repo (PR merged to main as `464fafd`). Bug 15 implemented:
-  migrate tetra-rx to sq5bpf-2 (legacy codec.diff retained from
-  sq5bpf), 64-byte voice header with TN/SSI/TSN/DECR, SSI-lock
-  primary gate with TN-lock fallback. Validation pending.
+  Frontend Bug 16 fixed in plugins repo. Bug 15 round 1 implemented:
+  migrate tetra-rx to sq5bpf-2, 64-byte voice header with
+  TN/SSI/TSN/DECR, SSI-lock primary. Calibration: 96% of frames
+  have SSI=0xFFFFFF (TETRA ALL-CALL) → SSI-lock churns and audio
+  worsens.
+- **Session 10**: Bug 15 round 2 added UM (usage_marker) — calibration
+  shows UM=0 always on this network/build. Unified UM>SSI>TN lock
+  also made audio worse (lock churn fragments codec). Reverted to
+  TN-only lock as final design. UM/SSI/TSN/DECR remain on the wire
+  for diagnostics. Build infra (sq5bpf-2 + 64-byte header) preserved.
+  Net result: same audio quality as Bug 14 alone ("partially
+  intelligible / partially scrambled"); per-talker demux is not
+  achievable on this network without an upper-MAC patch out of
+  scope of this branch.
